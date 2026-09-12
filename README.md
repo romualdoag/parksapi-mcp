@@ -45,6 +45,16 @@ Claude Desktop / Hermes config:
 }
 ```
 
+## Tests (vitest, 17 testes)
+
+```bash
+npm test   # build + suite completa
+```
+
+- `tests/service.test.ts` — helpers e registry (offline)
+- `tests/live.test.ts` — Efteling ao vivo (sem credenciais)
+- `tests/protocol.test.ts` — servidor real via JSON-RPC stdio
+
 ## Credentials
 
 Most destinations need upstream API credentials via env vars (see the

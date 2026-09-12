@@ -5,3 +5,4 @@ upstream/node_modules/
 upstream/dist/
 upstream/cache.sqlite
 upstream/.env
+cache.sqlite*

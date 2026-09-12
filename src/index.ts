@@ -12,11 +12,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
-  getAllDestinations,
-  getAllCategories,
-  getDestinationById,
-  getDestinationsByCategory,
-} from "@themeparks/parksapi";
+  listDestinations,
+  listCategories,
+  getDestination,
+  getEntities,
+  getLiveData,
+  getSchedules,
+} from "./service.js";
 
 const server = new McpServer({
   name: "parksapi-mcp",
@@ -30,28 +32,6 @@ type TextResult = {
 function asText(obj: unknown): TextResult {
   return {
     content: [{ type: "text", text: JSON.stringify(obj, null, 2) }],
-  };
-}
-
-async function getInstance(destination: string) {
-  const entry = await getDestinationById(destination);
-  if (!entry) {
-    const all = await getAllDestinations();
-    throw new Error(
-      `Unknown destination '${destination}'. Call list_destinations (${all.length} available) to find a valid id.`,
-    );
-  }
-  return new entry.DestinationClass();
-}
-
-function withLimit<T>(arr: T[], limit?: number) {
-  if (limit === undefined || limit <= 0) {
-    return { count: arr.length, truncated: false as const, data: arr };
-  }
-  return {
-    count: arr.length,
-    truncated: arr.length > limit,
-    data: arr.slice(0, limit),
   };
 }
 
@@ -71,11 +51,6 @@ const entityIdParam = z
   .optional()
   .describe("Filter to a single entity id (matches entry.id or entry.entityId).");
 
-function matchesEntity(entry: Record<string, unknown>, entityId?: string) {
-  if (!entityId) return true;
-  return entry["id"] === entityId || entry["entityId"] === entityId;
-}
-
 server.registerTool(
   "list_destinations",
   {
@@ -85,14 +60,7 @@ server.registerTool(
       category: z.string().optional().describe("Filter by category, e.g. 'Universal'. See list_categories."),
     },
   },
-  async ({ category }) => {
-    const list = category
-      ? await getDestinationsByCategory(category)
-      : await getAllDestinations();
-    return asText(
-      list.map((d) => ({ id: d.id, name: d.name, category: d.category })),
-    );
-  },
+  async ({ category }) => asText(await listDestinations(category)),
 );
 
 server.registerTool(
@@ -101,7 +69,7 @@ server.registerTool(
     description: "List all destination categories for filtering list_destinations.",
     inputSchema: {},
   },
-  async () => asText(await getAllCategories()),
+  async () => asText(await listCategories()),
 );
 
 server.registerTool(
@@ -111,20 +79,7 @@ server.registerTool(
       "Get details for one destination: id, name, category and the data available (entities, live data, schedules).",
     inputSchema: { destination: destinationParam },
   },
-  async ({ destination }) => {
-    const entry = await getDestinationById(destination);
-    if (!entry) {
-      throw new Error(
-        `Unknown destination '${destination}'. Call list_destinations to find a valid id.`,
-      );
-    }
-    return asText({
-      id: entry.id,
-      name: entry.name,
-      category: entry.category,
-      available: ["get_entities", "get_live_data", "get_schedules"],
-    });
-  },
+  async ({ destination }) => asText(await getDestination(destination)),
 );
 
 server.registerTool(
@@ -141,14 +96,8 @@ server.registerTool(
       limit: limitParam,
     },
   },
-  async ({ destination, entityType, limit }) => {
-    const park = await getInstance(destination);
-    let entities = await park.getEntities();
-    if (entityType) {
-      entities = entities.filter((e) => e.entityType === entityType);
-    }
-    return asText({ destination, entityType: entityType ?? "all", ...withLimit(entities, limit) });
-  },
+  async ({ destination, entityType, limit }) =>
+    asText(await getEntities(destination, { entityType, limit })),
 );
 
 server.registerTool(
@@ -158,14 +107,8 @@ server.registerTool(
       "Get live data (wait times, statuses, queues) for a destination. Optionally filter to one entity.",
     inputSchema: { destination: destinationParam, entityId: entityIdParam, limit: limitParam },
   },
-  async ({ destination, entityId, limit }) => {
-    const park = await getInstance(destination);
-    const live = await park.getLiveData();
-    const filtered = live.filter((e) =>
-      matchesEntity(e as unknown as Record<string, unknown>, entityId),
-    );
-    return asText({ destination, entityId: entityId ?? "all", ...withLimit(filtered, limit) });
-  },
+  async ({ destination, entityId, limit }) =>
+    asText(await getLiveData(destination, { entityId, limit })),
 );
 
 server.registerTool(
@@ -175,14 +118,8 @@ server.registerTool(
       "Get schedules (operating hours, show times) for a destination. Optionally filter to one entity.",
     inputSchema: { destination: destinationParam, entityId: entityIdParam, limit: limitParam },
   },
-  async ({ destination, entityId, limit }) => {
-    const park = await getInstance(destination);
-    const schedules = await park.getSchedules();
-    const filtered = schedules.filter((e) =>
-      matchesEntity(e as unknown as Record<string, unknown>, entityId),
-    );
-    return asText({ destination, entityId: entityId ?? "all", ...withLimit(filtered, limit) });
-  },
+  async ({ destination, entityId, limit }) =>
+    asText(await getSchedules(destination, { entityId, limit })),
 );
 
 await server.connect(new StdioServerTransport());

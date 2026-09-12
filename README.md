@@ -1,7 +1,10 @@
 # parksapi-mcp
 
 Generic MCP server over [`@themeparks/parksapi`](https://github.com/ThemeParks/parksapi) —
-every destination the library supports (80+ theme parks worldwide), no per-park code.
+every destination the library supports (80+ theme parks worldwide), no per-park code,
+**plus** the four Walt Disney World (Orlando) parks via the public
+[`api.themeparks.wiki`](https://www.themeparks.wiki/api) collector feed
+(the upstream TS library leaves WDW out of scope — see `src/hosted.ts`).
 
 ## Tools
 
@@ -45,15 +48,33 @@ Claude Desktop / Hermes config:
 }
 ```
 
-## Tests (vitest, 17 testes)
+## Tests (vitest, 26 testes)
 
 ```bash
 npm test   # build + suite completa
 ```
 
 - `tests/service.test.ts` — helpers e registry (offline)
+- `tests/hosted.test.ts` — mapeamento WDW + registry (offline, fetch stubado)
 - `tests/live.test.ts` — Efteling ao vivo (sem credenciais)
 - `tests/protocol.test.ts` — servidor real via JSON-RPC stdio
+
+## Walt Disney World (Orlando)
+
+Quatro destinations extras, categoria `Disney`, sem credenciais:
+
+| Park | `destination` |
+|---|---|
+| Magic Kingdom | `waltdisneyworldmagickingdom` |
+| Epcot | `waltdisneyworldepcot` |
+| Hollywood Studios | `waltdisneyworldhollywoodstudios` |
+| Animal Kingdom | `waltdisneyworldanimalkingdom` |
+
+Fonte: feed público do coletor (`api.themeparks.wiki/preview/parks/...`,
+mesmo padrão `HostedPark` da lib JS legada). `get_entities`,
+`get_live_data` e `get_schedules` funcionam igual aos outros parks.
+Para adicionar mais parks hospedados (ex. Disneyland California, Hong Kong),
+basta uma entrada em `HOSTED_DESTINATIONS` (`src/hosted.ts`).
 
 ## Credentials
 

@@ -8,13 +8,26 @@ import {
   getDestinationById,
   getDestinationsByCategory,
 } from "@themeparks/parksapi";
+import { HOSTED_BY_ID, HOSTED_DESTINATIONS } from "./hosted.js";
+
+function matchesCategory(
+  category: string | string[] | undefined,
+  wanted: string,
+): boolean {
+  if (!category) return false;
+  const list = Array.isArray(category) ? category : [category];
+  return list.some((c) => c.toLowerCase() === wanted.toLowerCase());
+}
 
 export async function getInstance(destination: string) {
+  const hosted = HOSTED_BY_ID.get(destination);
+  if (hosted) return new hosted.DestinationClass();
   const entry = await getDestinationById(destination);
   if (!entry) {
     const all = await getAllDestinations();
+    const total = all.length + HOSTED_DESTINATIONS.length;
     throw new Error(
-      `Unknown destination '${destination}'. Call list_destinations (${all.length} available) to find a valid id.`,
+      `Unknown destination '${destination}'. Call list_destinations (${total} available) to find a valid id.`,
     );
   }
   return new entry.DestinationClass();
@@ -40,16 +53,32 @@ export async function listDestinations(category?: string) {
   const list = category
     ? await getDestinationsByCategory(category)
     : await getAllDestinations();
-  return list.map((d) => ({ id: d.id, name: d.name, category: d.category }));
+  const base = list.map((d) => ({ id: d.id, name: d.name, category: d.category }));
+  const hosted = HOSTED_DESTINATIONS.filter(
+    (d) => !category || matchesCategory(d.category, category),
+  ).map((d) => ({ id: d.id, name: d.name, category: d.category }));
+  const seen = new Set(base.map((d) => d.id));
+  return [...base, ...hosted.filter((d) => !seen.has(d.id))];
 }
 
 export async function listCategories() {
-  return getAllCategories();
+  const cats = new Set<string>(await getAllCategories());
+  for (const d of HOSTED_DESTINATIONS) cats.add(d.category);
+  return [...cats];
 }
 
 const AVAILABLE = ["get_entities", "get_live_data", "get_schedules"] as const;
 
 export async function getDestination(destination: string) {
+  const hosted = HOSTED_BY_ID.get(destination);
+  if (hosted) {
+    return {
+      id: hosted.id,
+      name: hosted.name,
+      category: hosted.category,
+      available: [...AVAILABLE],
+    };
+  }
   const entry = await getDestinationById(destination);
   if (!entry) {
     throw new Error(

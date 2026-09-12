@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+upstream/node_modules/
+upstream/dist/
+upstream/cache.sqlite
+upstream/.env

@@ -1,0 +1,423 @@
+/**
+ * Unit tests for Europa-Park pure helpers.
+ *
+ * The class itself is integration-tested via `npm run dev -- europapark`.
+ * Pure logic is exercised here without network access.
+ */
+import {describe, test, expect} from 'vitest';
+import {EuropaPark} from '../europapark.js';
+import {addDays, formatInTimezone} from '../../../datetime.js';
+
+const TZ = 'Europe/Berlin';
+
+/** Date offset from now as a YYYY-MM-DD string in the park timezone. */
+const isoDay = (offsetDays: number): string => {
+  const [mm, dd, yyyy] = formatInTimezone(addDays(new Date(), offsetDays), TZ, 'date').split('/');
+  return `${yyyy}-${mm}-${dd}`;
+};
+
+/**
+ * Subclass that stubs the two network-backed getters so buildSchedules() can be
+ * exercised offline. buildSchedules() is protected; expose it for assertions.
+ */
+class ScheduleProbe extends EuropaPark {
+  private readonly _seasons: any[];
+  private readonly _live: any;
+  constructor(seasons: any[], live: any = {}) {
+    super();
+    this._seasons = seasons;
+    this._live = live;
+  }
+  override async getSeasons(): Promise<any> {
+    return this._seasons;
+  }
+  override async getLiveCalendar(): Promise<any> {
+    return this._live;
+  }
+  public schedules(): Promise<any[]> {
+    return this.buildSchedules();
+  }
+  /** Find the OPERATING entry for a given date in the main Europa-Park schedule. */
+  async operatingEntry(date: string): Promise<any> {
+    const scheds = await this.schedules();
+    const main = scheds.find((s) => s.id === 'park_493');
+    return main?.schedule.find((e: any) => e.date === date && e.type === 'OPERATING');
+  }
+}
+
+describe('Europa-Park schedule: post-midnight closing time', () => {
+  test('special-day 00:00 close (Sommernächte) rolls to the next calendar day', async () => {
+    const special = isoDay(30);
+    const next = isoDay(31);
+    const probe = new ScheduleProbe([
+      {
+        startAt: `${isoDay(-10)}T09:00:00+02:00`,
+        endAt: `${isoDay(60)}T18:00:00+02:00`,
+        scopes: ['europapark'],
+        status: 'live',
+        closed: false,
+        specialOpenTimes: [
+          {
+            dateAt: `${special}T00:00:00+02:00`,
+            startAt: `${special}T09:00:00+02:00`,
+            endAt: `${special}T00:00:00+02:00`, // closing BEFORE opening in upstream feed
+          },
+        ],
+      },
+    ]);
+
+    const entry = await probe.operatingEntry(special);
+    expect(entry).toBeDefined();
+    expect(entry.openingTime.startsWith(`${special}T09:00`)).toBe(true);
+    // Closing rolled forward to 00:00 of the following day.
+    expect(entry.closingTime.startsWith(`${next}T00:00`)).toBe(true);
+    // Core invariant: the operating window is positive.
+    expect(new Date(entry.closingTime).getTime()).toBeGreaterThan(
+      new Date(entry.openingTime).getTime(),
+    );
+  });
+
+  test('regular-day 00:00 close also rolls forward (both branches covered)', async () => {
+    const regular = isoDay(5);
+    const next = isoDay(6);
+    const probe = new ScheduleProbe([
+      {
+        startAt: `${isoDay(-10)}T10:00:00+02:00`,
+        endAt: `${isoDay(60)}T00:00:00+02:00`, // daily close component = midnight
+        scopes: ['europapark'],
+        status: 'live',
+        closed: false,
+      },
+    ]);
+
+    const entry = await probe.operatingEntry(regular);
+    expect(entry).toBeDefined();
+    expect(entry.closingTime.startsWith(`${next}T00:00`)).toBe(true);
+    expect(new Date(entry.closingTime).getTime()).toBeGreaterThan(
+      new Date(entry.openingTime).getTime(),
+    );
+  });
+
+  test('normal 18:00 close is left unchanged (no regression)', async () => {
+    const regular = isoDay(5);
+    const probe = new ScheduleProbe([
+      {
+        startAt: `${isoDay(-10)}T09:00:00+02:00`,
+        endAt: `${isoDay(60)}T18:00:00+02:00`,
+        scopes: ['europapark'],
+        status: 'live',
+        closed: false,
+      },
+    ]);
+
+    const entry = await probe.operatingEntry(regular);
+    expect(entry).toBeDefined();
+    expect(entry.closingTime.startsWith(`${regular}T18:00`)).toBe(true);
+    expect(entry.closingTime.substring(0, 10)).toBe(regular); // not rolled
+  });
+
+  test('special day with startAt set but endAt null does not crash (regression)', async () => {
+    // The seasons type allows endAt === null independently of startAt. Such an
+    // entry reaches the roll helper with a null closingTime; it must pass through
+    // untouched rather than throw on substring().
+    const special = isoDay(20);
+    const probe = new ScheduleProbe([
+      {
+        startAt: `${isoDay(-10)}T09:00:00+02:00`,
+        endAt: `${isoDay(60)}T18:00:00+02:00`,
+        scopes: ['europapark'],
+        status: 'live',
+        closed: false,
+        specialOpenTimes: [
+          {
+            dateAt: `${special}T00:00:00+02:00`,
+            startAt: `${special}T09:00:00+02:00`,
+            endAt: null,
+          },
+        ],
+      },
+    ]);
+
+    await expect(probe.schedules()).resolves.toBeDefined();
+    const entry = await probe.operatingEntry(special);
+    expect(entry).toBeDefined();
+    expect(entry.closingTime).toBeNull(); // preserved, not rolled, not crashed
+  });
+
+  test('live "today" overlay with a 00:00 end rolls forward too', async () => {
+    const today = isoDay(0);
+    const next = isoDay(1);
+    const probe = new ScheduleProbe(
+      [
+        {
+          startAt: `${isoDay(-10)}T09:00:00+02:00`,
+          endAt: `${isoDay(60)}T18:00:00+02:00`,
+          scopes: ['europapark'],
+          status: 'live',
+          closed: false,
+        },
+      ],
+      {
+        today: {
+          date: `${today}T00:00:00+02:00`,
+          start: `${today}T09:00:00+02:00`,
+          end: `${today}T00:00:00+02:00`, // live feed reports midnight close
+        },
+      },
+    );
+
+    const entry = await probe.operatingEntry(today);
+    expect(entry).toBeDefined();
+    expect(entry.closingTime.startsWith(`${next}T00:00`)).toBe(true);
+    expect(new Date(entry.closingTime).getTime()).toBeGreaterThan(
+      new Date(entry.openingTime).getTime(),
+    );
+  });
+});
+
+const mkWait = (code: number, time = 0) => ({code, time});
+const mkAttraction = (id: number, code: number) =>
+  ({id: `pois_${id}`, name: `Attraction ${id}`, entityType: 'ATTRACTION', scopes: ['europapark'], code} as any);
+
+// Sub-class to expose the protected helpers for testing.
+class Probe extends EuropaPark {
+  public probe(waits: any[], entities: any[]): boolean {
+    return this._isWaitsGlitch(waits, entities);
+  }
+
+  public expressLive(waits: any[]): any[] {
+    return this._buildExpressLiveData(waits);
+  }
+}
+
+describe('_isWaitsGlitch', () => {
+  const probe = new Probe();
+
+  test('returns false when no coded attractions exist', () => {
+    // Defensive: avoid divide-by-zero when the entity build returned nothing.
+    expect(probe.probe([mkWait(1)], [])).toBe(false);
+  });
+
+  test('returns false on a typical operating-day mix (~45% of attractions in waits)', () => {
+    const entities = Array.from({length: 100}, (_, i) => mkAttraction(i, i));
+    const waits = Array.from({length: 45}, (_, i) => mkWait(i, 5 + (i % 30)));
+    expect(probe.probe(waits, entities)).toBe(false);
+  });
+
+  test('returns false at the boundary (exactly 85%)', () => {
+    // Strict > 0.85 — equal-to is treated as non-glitch.
+    const entities = Array.from({length: 100}, (_, i) => mkAttraction(i, i));
+    const waits = Array.from({length: 85}, (_, i) => mkWait(i, 0));
+    expect(probe.probe(waits, entities)).toBe(false);
+  });
+
+  test('returns true just above the boundary (86%)', () => {
+    const entities = Array.from({length: 100}, (_, i) => mkAttraction(i, i));
+    const waits = Array.from({length: 86}, (_, i) => mkWait(i, 0));
+    expect(probe.probe(waits, entities)).toBe(true);
+  });
+
+  test('returns true for the observed glitch fingerprint (~94% of catalogue)', () => {
+    // 2026-04-20 shape: ~129 of ~137 coded attractions present.
+    const entities = Array.from({length: 137}, (_, i) => mkAttraction(i, i));
+    const waits = Array.from({length: 129}, (_, i) => mkWait(i, 0));
+    expect(probe.probe(waits, entities)).toBe(true);
+  });
+
+  test('returns true even when wait values look plausible (different time shape)', () => {
+    // Detector is agnostic to time values — a future glitch with all entries
+    // showing e.g. waitTime=1 would still match if it covered the whole
+    // catalogue. This is the headline reason we picked this signal.
+    const entities = Array.from({length: 100}, (_, i) => mkAttraction(i, i));
+    const waits = Array.from({length: 95}, (_, i) => mkWait(i, 1));
+    expect(probe.probe(waits, entities)).toBe(true);
+  });
+
+  test('ignores SHOW entities in the denominator', () => {
+    // Shows have codes and appear in the entities list but should not count
+    // toward the attraction catalogue.
+    const entities = [
+      ...Array.from({length: 50}, (_, i) => mkAttraction(i, i)),
+      ...Array.from({length: 30}, (_, i) =>
+        ({id: `shows_${i}`, name: `Show ${i}`, entityType: 'SHOW', scopes: ['europapark'], code: 9000 + i} as any),
+      ),
+    ];
+    const waits = Array.from({length: 46}, (_, i) => mkWait(i, 0));
+    // 46/50 attractions = 92% → glitch, even though 46/80 entities is only 58%.
+    expect(probe.probe(waits, entities)).toBe(true);
+  });
+
+  test('ignores attractions without a code (cannot appear in waits)', () => {
+    // No-code attractions (walk-around trails, saunas) can never appear in
+    // waits, so they must be excluded from the denominator.
+    const entities = [
+      ...Array.from({length: 50}, (_, i) => mkAttraction(i, i)),
+      ...Array.from({length: 10}, (_, i) => mkAttraction(2000 + i, undefined as any)),
+    ];
+    const waits = Array.from({length: 46}, (_, i) => mkWait(i, 0));
+    // 46/50 coded attractions = 92%. With the 10 no-code attractions counted,
+    // the ratio would be 46/60 = 77% and we'd miss the glitch.
+    expect(probe.probe(waits, entities)).toBe(true);
+  });
+
+  test('ignores attractions with NaN/Infinity codes', () => {
+    // Non-finite codes from malformed upstream JSON would inflate the
+    // denominator without ever matching a wait; mirrors the Number.isFinite
+    // gate already applied to waits.
+    const entities = [
+      ...Array.from({length: 50}, (_, i) => mkAttraction(i, i)),
+      mkAttraction(9001, NaN),
+      mkAttraction(9002, Infinity),
+    ];
+    const waits = Array.from({length: 46}, (_, i) => mkWait(i, 0));
+    expect(probe.probe(waits, entities)).toBe(true);
+  });
+});
+
+// ── Show name resolution ────────────────────────────────────────────────────
+// Some upstream shows (e.g. Rulantica show 133 "TALENT ACADEMY on Stage")
+// arrive with an empty public `name` while the title sits in `analyticsName`.
+// Without a fallback they are dropped by the `if (!name) return` guard and
+// never reach the entity list / moderation queue.
+class EntityProbe extends EuropaPark {
+  private readonly _pois: any[];
+  constructor(pois: any[]) {
+    super();
+    this._pois = pois;
+  }
+  override async getPOIs(): Promise<any> {
+    return this._pois;
+  }
+}
+
+describe('getParkEntities show name fallback', () => {
+  const pois = [
+    {
+      id: 747,
+      type: 'showlocation',
+      name: 'Stage at Skip Strand',
+      scopes: ['rulantica'],
+      latitude: 48.26,
+      longitude: 7.74,
+      shows: [
+        {id: 133, name: '', analyticsName: 'TALENT ACADEMY on Stage'},
+        {id: 134, name: 'The secret of the vikings', analyticsName: 'internal label'},
+        {id: 135, name: '', analyticsName: ''},
+      ],
+    },
+  ];
+
+  test('falls back to analyticsName when a show has an empty name', async () => {
+    const entities = await new EntityProbe(pois).getParkEntities();
+    const show133 = entities.find((e) => e.id === 'shows_133');
+    expect(show133).toBeDefined();
+    expect(show133!.name).toBe('TALENT ACADEMY on Stage');
+    expect(show133!.entityType).toBe('SHOW');
+  });
+
+  test('keeps the public name when one is present', async () => {
+    const entities = await new EntityProbe(pois).getParkEntities();
+    const show134 = entities.find((e) => e.id === 'shows_134');
+    expect(show134!.name).toBe('The secret of the vikings');
+  });
+
+  test('still skips a show with neither name nor analyticsName', async () => {
+    const entities = await new EntityProbe(pois).getParkEntities();
+    expect(entities.find((e) => e.id === 'shows_135')).toBeUndefined();
+  });
+});
+
+// ── EP-Express shuttle live data ─────────────────────────────────────────────
+// The hotelapp feed reports an ETA per (station, vehicle); a station's wait time
+// is the nearest train's ETA (min over vehicles), and a station with no ETA is
+// CLOSED. Station ids in the feed differ from the POI ids, so the mapping is the
+// load-bearing part to pin down.
+const mkExpress = (station: number, vehicle: number, waitingMinutes: number) =>
+  ({station, vehicle, waitingMinutes});
+
+describe('_buildExpressLiveData', () => {
+  const probe = new Probe();
+  const byId = (live: any[], id: string) => live.find((l) => l.id === id);
+
+  test('maps each feed station id to the correct POI entity id', () => {
+    const live = probe.expressLive([
+      mkExpress(1, 1, 5),
+      mkExpress(2, 1, 5),
+      mkExpress(3, 1, 5),
+      mkExpress(4, 1, 5),
+    ]);
+    // 1→Alexanderplatz, 2→Spain, 3→Greece, 4→Hotels
+    expect(byId(live, 'pois_60')).toBeDefined();
+    expect(byId(live, 'pois_62')).toBeDefined();
+    expect(byId(live, 'pois_61')).toBeDefined();
+    expect(byId(live, 'pois_395')).toBeDefined();
+  });
+
+  test('always emits exactly the four known stations', () => {
+    const live = probe.expressLive([mkExpress(1, 1, 3)]);
+    expect(live).toHaveLength(4);
+    expect(new Set(live.map((l) => l.id))).toEqual(
+      new Set(['pois_60', 'pois_62', 'pois_61', 'pois_395']),
+    );
+  });
+
+  test('uses the minimum ETA across the trains serving a station', () => {
+    // Two trains report ETAs for station 1; the nearest (smaller) wins.
+    const live = probe.expressLive([
+      mkExpress(1, 1, 13),
+      mkExpress(1, 3, 2),
+    ]);
+    const station = byId(live, 'pois_60');
+    expect(station.status).toBe('OPERATING');
+    expect(station.queue.STANDBY.waitTime).toBe(2);
+  });
+
+  test('a station with an ETA is OPERATING with that wait', () => {
+    const live = probe.expressLive([mkExpress(4, 3, 7)]);
+    const station = byId(live, 'pois_395');
+    expect(station.status).toBe('OPERATING');
+    expect(station.queue.STANDBY.waitTime).toBe(7);
+  });
+
+  test('a waitTime of 0 (train at platform) is a valid OPERATING wait', () => {
+    const live = probe.expressLive([mkExpress(3, 1, 0)]);
+    const station = byId(live, 'pois_61');
+    expect(station.status).toBe('OPERATING');
+    expect(station.queue.STANDBY.waitTime).toBe(0);
+  });
+
+  test('a station with no ETA is CLOSED with no queue', () => {
+    // Only station 1 reports — the other three are absent (e.g. a parked train).
+    const live = probe.expressLive([mkExpress(1, 1, 4)]);
+    const station2 = byId(live, 'pois_62');
+    expect(station2.status).toBe('CLOSED');
+    expect(station2.queue).toBeUndefined();
+  });
+
+  test('an empty feed (after close / no trains) marks all four CLOSED', () => {
+    const live = probe.expressLive([]);
+    expect(live).toHaveLength(4);
+    for (const l of live) {
+      expect(l.status).toBe('CLOSED');
+      expect(l.queue).toBeUndefined();
+    }
+  });
+
+  test('ignores non-finite and negative waitingMinutes', () => {
+    // A station whose only readings are unusable falls through to CLOSED;
+    // mixed-in junk for a served station is dropped without poisoning the min.
+    const live = probe.expressLive([
+      mkExpress(1, 1, NaN as any),
+      mkExpress(1, 3, -1),
+      mkExpress(2, 1, Infinity as any),
+      mkExpress(2, 3, 'oops' as any),
+      mkExpress(3, 1, -5),
+      mkExpress(3, 3, 9),
+    ]);
+    expect(byId(live, 'pois_60').status).toBe('CLOSED'); // station 1: NaN + negative → none
+    expect(byId(live, 'pois_62').status).toBe('CLOSED'); // station 2: Infinity + string → none
+    const station3 = byId(live, 'pois_61');
+    expect(station3.status).toBe('OPERATING'); // station 3: -5 dropped, 9 kept
+    expect(station3.queue.STANDBY.waitTime).toBe(9);
+  });
+});

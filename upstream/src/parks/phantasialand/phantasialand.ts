@@ -1,0 +1,696 @@
+import {Destination, DestinationConstructor} from '../../destination.js';
+import crypto from 'crypto';
+
+import {cache} from '../../cache.js';
+import {CacheLib} from '../../cache.js';
+import {http, HTTPObj} from '../../http.js';
+import {inject} from '../../injector.js';
+import config from '../../config.js';
+import {destinationController} from '../../destinationRegistry.js';
+import {
+  Entity,
+  LiveData,
+  EntitySchedule,
+} from '@themeparks/typelib';
+import {constructDateTime, hostnameFromUrl, formatDate} from '../../datetime.js';
+import {TagBuilder} from '../../tags/index.js';
+import {decodeHtmlEntities} from '../../htmlUtils.js';
+
+/**
+ * Normalise the Phantasialand API's name-ish fields. The API has at various
+ * times returned either a bare string (in the default language) or an object
+ * like {en, de, ...}. Accept both without losing data: when only a string is
+ * given, use it as both locales so the framework's locale resolution still
+ * works downstream.
+ */
+function pickLocalisedName(raw: unknown): {en: string; de: string} {
+  if (!raw) return {en: '', de: ''};
+  if (typeof raw === 'string') return {en: raw, de: raw};
+  if (typeof raw === 'object') {
+    const o = raw as Record<string, string | undefined>;
+    const en = o.en || '';
+    const de = o.de || en || '';
+    return {en: en || de, de};
+  }
+  return {en: '', de: ''};
+}
+
+// Category to entity type mapping
+const categoryToEntityType: Record<string, Entity['entityType'] | undefined> = {
+  'ATTRACTIONS': 'ATTRACTION',
+  'SHOWS': 'SHOW',
+  'THE_SIX_DRAGONS': 'SHOW',
+  'THEATER': 'SHOW',
+  'RESTAURANTS_AND_SNACKS': 'RESTAURANT',
+  'PHANTASIALAND_HOTELS_RESTAURANTS': 'RESTAURANT',
+};
+
+/**
+ * How old a signage row may be and still count as an observation.
+ *
+ * The feed rewrites its whole snapshot every ~2 minutes under one shared
+ * timestamp, so a row it is still reporting on is minutes old; there is no
+ * per-venue cadence that could make a live row legitimately stale. Rows for
+ * venues removed from the signage config are never pruned and never touched
+ * again: the youngest observed is 54 days, the oldest 2.7 years.
+ *
+ * A week sits 8x clear of the nearest relic while tolerating a feed outage
+ * far longer than any observed. It is deliberately not tighter — the cost of
+ * being wrong in that direction is every row going stale at once.
+ */
+const MAX_SIGNAGE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Milliseconds since a signage row was last regenerated, or null when it
+ * carries no readable timestamp.
+ *
+ * Null means "cannot tell", and the caller keeps the row: dropping on missing
+ * evidence would silently empty the feed if the shape ever changes. All three
+ * fields are consulted so a row is only considered stale when every timestamp
+ * agrees it is.
+ */
+function signageRowAge(entry: any, nowMs: number): number | null {
+  const stamps = [entry?.updatedAt, entry?.createdAt, entry?.updatedRow]
+    .map((value) => (typeof value === 'string' ? Date.parse(value) : NaN))
+    .filter((ms) => Number.isFinite(ms));
+
+  if (stamps.length === 0) return null;
+
+  // The newest of the three is the row-write time. Measured ordering is
+  // always `updatedAt < createdAt = updatedRow`: updatedAt is the upstream
+  // data tick and lags the write by a minute or so. Relics keep their own
+  // frozen updatedAt rather than picking up the current tick, so taking the
+  // newest cannot resurrect one.
+  return nowMs - Math.max(...stamps);
+}
+
+@destinationController({category: 'Phantasialand'})
+export class Phantasialand extends Destination {
+  @config
+  apiBase: string = '';
+
+  @config
+  timezone: string = 'Europe/Berlin';
+
+  constructor(options?: DestinationConstructor) {
+    super(options);
+    this.addConfigPrefix('PHANTASIALAND');
+  }
+
+  // ===== Authentication =====
+
+  /**
+   * Create an anonymous user for API access.
+   * Returns email and password credentials, cached for 11 months.
+   */
+  @cache({ttlSeconds: 28908060})
+  async createUser(): Promise<{email: string; password: string}> {
+    const email = `${crypto.randomUUID()}@android.com`;
+    const password = crypto.randomUUID();
+
+    const resp = await this.fetchCreateUser(email, password);
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(`Failed to create Phantasialand user: ${resp.status} ${JSON.stringify(data)}`);
+    }
+
+    return {email, password};
+  }
+
+  @http({})
+  async fetchCreateUser(email: string, password: string): Promise<HTTPObj> {
+
+    return {
+      method: 'POST',
+      url: `${this.apiBase}/app-users`,
+      body: {
+        email,
+        password,
+        language: 'en',
+        platform: 'android',
+      },
+      options: {json: true},
+      tags: ['auth'],
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Login with credentials to get an access token.
+   * Cached for 24 hours. The server returns `ttl: 31556926` (~365 days)
+   * but empirically prunes anonymous accounts well before then, with no
+   * advance signal — so we re-auth daily rather than trust the nominal TTL.
+   */
+  @cache({
+    ttlSeconds: 86400,
+    key: 'phantasialand:accessToken',
+  })
+  async getAccessToken(): Promise<string> {
+    const {email, password} = await this.createUser();
+
+    const resp = await this.fetchLogin(email, password);
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(`Failed to login to Phantasialand: ${resp.status} ${JSON.stringify(data)}`);
+    }
+
+    return data.id;
+  }
+
+  @http({})
+  async fetchLogin(email: string, password: string): Promise<HTTPObj> {
+    return {
+      method: 'POST',
+      url: `${this.apiBase}/app-users/login`,
+      body: {
+        email,
+        password,
+        ttl: 31556926,
+      },
+      options: {json: true},
+      tags: ['auth'],
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Handle 401/403 responses. Both nullify the response so the HTTP framework
+   * retries the request (4xx is otherwise non-retryable). Skipped for auth
+   * requests themselves to avoid infinite loops.
+   *
+   * 401 — unambiguous: token is invalid. Invalidate immediately.
+   *
+   * 403 — ambiguous: phlsys returns the same body for brief per-IP rate
+   * limits AND for revoked/expired tokens. Eager re-login on every 403
+   * doubles our request rate in rate-limit windows and makes the limit
+   * stick longer. So we only invalidate on the *final* retry — by which
+   * point any transient rate limit has had its full ~31s exponential-
+   * backoff window to clear. If the request is still 403 after all
+   * retries, the cause is much more likely a stale token, and the next
+   * polling cycle will pick up a fresh one.
+   */
+  @inject({
+    eventName: 'httpError',
+    hostname: function() { return hostnameFromUrl(this.apiBase); },
+    tags: {$nin: ['auth']},
+  } as any)
+  async handleUnauthorized(requestObj: HTTPObj): Promise<void> {
+    const status = requestObj.response?.status;
+    if (status !== 401 && status !== 403) return;
+
+    if (status === 401) {
+      // Invalid token — clear both token AND user. If the anonymous account
+      // was pruned server-side, re-login succeeds but the issued token still
+      // 401s; forcing a new createUser on retry is the only recovery path.
+      CacheLib.delete('phantasialand:accessToken');
+      CacheLib.delete(`${this.constructor.name}:createUser:[]`);
+    } else if (status === 403 && (requestObj as any).retries === 0) {
+      // Last retry exhausted with 403 — likely a stale token. Internal
+      // `retries` counter on HTTPRequestImpl isn't exposed on HTTPObj, so
+      // we read it via an `any` cast.
+      CacheLib.delete('phantasialand:accessToken');
+    }
+
+    // Nullify the response so the HTTP queue treats it as retryable.
+    requestObj.response = undefined as any;
+  }
+
+  // ===== Header & Token Injection =====
+
+  /**
+   * Inject user-agent into all API requests
+   */
+  @inject({
+    eventName: 'httpRequest',
+    hostname: function() { return hostnameFromUrl(this.apiBase); },
+  })
+  async injectHeaders(requestObj: HTTPObj): Promise<void> {
+    requestObj.headers = {
+      ...requestObj.headers,
+      'user-agent': 'okhttp/3.12.1',
+      // The POI endpoint with compact=true used to default to English-or-
+      // structured titles; in 2026 it switched to localising on
+      // Accept-Language alone, defaulting to German. Force English so we
+      // get e.g. "Dragon Drago" instead of "Drache Drago".
+      'accept-language': 'en',
+    };
+  }
+
+  /**
+   * Inject access_token query parameter into GET requests.
+   * Excludes auth-related requests (those with app-users in URL).
+   */
+  @inject({
+    eventName: 'httpRequest',
+    hostname: function() { return hostnameFromUrl(this.apiBase); },
+    tags: {$nin: ['auth']},
+  })
+  async injectAccessToken(requestObj: HTTPObj): Promise<void> {
+    // Only inject for GET requests that are not auth-related
+    if (requestObj.method !== 'GET') return;
+    if (requestObj.url.includes('app-users')) return;
+
+    const token = await this.getAccessToken();
+
+    // Append access_token as query parameter
+    const url = new URL(requestObj.url);
+    url.searchParams.set('access_token', token);
+    requestObj.url = url.toString();
+  }
+
+  // ===== HTTP Fetch Methods =====
+
+  /**
+   * Fetch POI data (entity list).
+   *
+   * No cacheSeconds: getPOI's @cache layer is the authoritative cache.
+   * The @http cache key is hashed before request injectors run, so
+   * accept-language wouldn't participate — keeping it would mean a stale
+   * German-titled response could outlive a cacheVersion bump on getPOI.
+   */
+  @http({retries: 2})
+  async fetchPOI(): Promise<HTTPObj> {
+
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/pois?filter[where][seasons][like]=%&compact=true`,
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Get POI data (cached 6 hours)
+   */
+  @cache({ttlSeconds: 21600, cacheVersion: 2})
+  async getPOI(): Promise<any[]> {
+
+    const resp = await this.fetchPOI();
+    const data = await resp.json();
+    return Array.isArray(data) ? data : [];
+  }
+
+  /**
+   * Fetch signage/wait time data.
+   * Requires random coordinates within park bounds.
+   *
+   * `retries: 5` gives an exponential-backoff window of ~31s
+   * (1+2+4+8+16). phlsys rate-limits this endpoint per IP and the
+   * window typically clears within a few seconds, but a shorter retry
+   * budget (e.g. 2 → 3s) gives up too early during sustained bursts.
+   */
+  @http({cacheSeconds: 60, retries: 5}) // 1 minute
+  async fetchSignage(): Promise<HTTPObj> {
+    // Generate random coordinates within park bounds
+    const lat = 50.799683077 + (Math.random() * (50.800659529 - 50.799683077));
+    const lng = 6.877570152 + (Math.random() * (6.878342628 - 6.877570152));
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/signage-snapshots?loc=${lat},${lng}`,
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Get signage data (cached 1 minute).
+   */
+  @cache({ttlSeconds: 60})
+  async getSignage(): Promise<any[]> {
+    const resp = await this.fetchSignage();
+    const data = await resp.json();
+    return Array.isArray(data) ? data : [];
+  }
+
+  /**
+   * Fetch live park info (isOpen, closing time) from API
+   */
+  @http({cacheSeconds: 300, retries: 2}) // 5 min
+  async fetchParkInfos(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/park-infos`,
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  @cache({ttlSeconds: 300})
+  async getParkInfos(): Promise<any> {
+    try {
+      const resp = await this.fetchParkInfos();
+      const data = await resp.json();
+      return Array.isArray(data) ? data[0] : data;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Fetch schedule HTML page
+   */
+  @http({cacheSeconds: 21600}) // 6 hours
+  async fetchScheduleHTML(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: 'https://www.phantasialand.de/en/theme-park/opening-hours/',
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Parse calendar JSON from schedule HTML page (cached 6 hours)
+   */
+  @cache({ttlSeconds: 21600})
+  async getCalendarJSON(): Promise<any[]> {
+    const resp = await this.fetchScheduleHTML();
+    const html = await resp.text();
+
+    // Find data-calendar attribute
+    const match = html.match(/data-calendar='(\[.*?\])'/s);
+    if (!match) return [];
+
+    // Clean HTML entities
+    const jsonStr = decodeHtmlEntities(match[1]);
+
+    try {
+      return JSON.parse(jsonStr);
+    } catch {
+      console.warn('[Phantasialand] Failed to parse calendar JSON');
+      return [];
+    }
+  }
+
+  // ===== Data Builder Methods =====
+
+  async getDestinations(): Promise<Entity[]> {
+    return [{
+      id: 'phantasialanddest',
+      name: {en: 'Phantasialand', de: 'Phantasialand'},
+      entityType: 'DESTINATION',
+      timezone: this.timezone,
+      location: {latitude: 50.798995255201866, longitude: 6.879291227409914},
+    } as Entity];
+  }
+
+  protected async buildEntityList(): Promise<Entity[]> {
+    const pois = await this.getPOI();
+
+    const destinationId = 'phantasialanddest';
+    const parkId = 'phantasialand';
+
+    const parkEntity: Entity = {
+      id: parkId,
+      name: {en: 'Phantasialand', de: 'Phantasialand'},
+      entityType: 'PARK',
+      parentId: destinationId,
+      destinationId,
+      timezone: this.timezone,
+      location: {latitude: 50.798995255201866, longitude: 6.879291227409914},
+    } as Entity;
+
+    // Filter and map POIs
+    const poiEntries: Array<{
+      id: string;
+      enName: string;
+      deName: string;
+      entityType: Entity['entityType'];
+      lat?: number;
+      lng?: number;
+      apiTags: string[];
+      minSize?: number;
+      maxSize?: number;
+    }> = [];
+
+    for (const poi of pois) {
+      // Skip admin-only entries
+      if (poi.adminOnly) continue;
+
+      // Skip entries without seasons
+      if (!poi.seasons || !Array.isArray(poi.seasons) || poi.seasons.length === 0) continue;
+
+      const category = poi.category;
+      let entityType = categoryToEntityType[category];
+
+      // For hotel restaurant category, only include if tagged as RESTAURANT
+      if (category === 'PHANTASIALAND_HOTELS_RESTAURANTS') {
+        if (!Array.isArray(poi.tags) || !poi.tags.includes('RESTAURANT')) continue;
+      }
+
+      if (!entityType) continue;
+
+      // Build multi-language name. The API ships two shapes:
+      //   - Legacy / full:   title = {en, de}
+      //   - compact=true:    title is a bare string in the API's default
+      //                      language (German) with a separate tagline
+      // Accept either; fall back to the tagline/name fields if title's empty.
+      const {en: enName, de: deName} = pickLocalisedName(
+        poi.title ?? poi._title ?? poi.name,
+      );
+      if (!enName && !deName) continue;
+
+      // Parse location
+      let lat: number | undefined;
+      let lng: number | undefined;
+      const entrance = poi.entrance || poi._entrance;
+      if (entrance?.world?.lat && entrance?.world?.lng) {
+        lat = Number(entrance.world.lat);
+        lng = Number(entrance.world.lng);
+      }
+
+      poiEntries.push({
+        id: String(poi.id),
+        enName: enName || deName,
+        deName: deName || enName,
+        entityType,
+        lat,
+        lng,
+        apiTags: Array.isArray(poi.tags) ? poi.tags : [],
+        minSize: poi.minSize,
+        maxSize: poi.maxSize,
+      });
+    }
+
+    const entities = this.mapEntities(poiEntries, {
+      idField: 'id',
+      nameField: (item) => ({en: item.enName, de: item.deName}),
+      entityType: 'ATTRACTION', // overridden by transform
+      parentIdField: () => parkId,
+      destinationId,
+      timezone: this.timezone,
+      locationFields: {lat: 'lat', lng: 'lng'},
+      transform: (entity, item) => {
+        entity.entityType = item.entityType;
+        const tags = [];
+        // API tags
+        if (item.apiTags.includes('ATTRACTION_TYPE_WATER')) tags.push(TagBuilder.mayGetWet());
+        if (item.apiTags.includes('ATTRACTION_TYPE_SINGLE_RIDER_LINE')) tags.push(TagBuilder.singleRider());
+        if (item.apiTags.includes('ATTRACTION_TYPE_PICTURES')) tags.push(TagBuilder.onRidePhoto());
+        if (item.apiTags.includes('ATTRACTION_TYPE_QUICK_PASS') || item.apiTags.includes('ATTRACTION_TYPE_QUICK_PASS_PLUS')) {
+          tags.push(TagBuilder.paidReturnTime());
+        }
+        // Height restrictions
+        if (item.minSize) tags.push(TagBuilder.minimumHeight(item.minSize, 'cm'));
+        if (item.maxSize) tags.push(TagBuilder.maximumHeight(item.maxSize, 'cm'));
+        if (tags.length > 0) entity.tags = tags;
+        return entity;
+      },
+    });
+
+    return [parkEntity, ...entities];
+  }
+
+  protected async buildLiveData(): Promise<LiveData[]> {
+    const signage = await this.getSignage();
+    const liveData: LiveData[] = [];
+    const nowMs = Date.now();
+    let staleRows = 0;
+
+    for (const entry of signage) {
+      if (!entry.poiId) continue;
+
+      const entityId = String(entry.poiId);
+
+      // The signage feed regenerates a row for every venue it is still
+      // reporting on, and never deletes the ones it has stopped reporting.
+      // Retired rows keep their original timestamp and their last observed
+      // state forever — Mystic Winter Castle was published OPERATING with
+      // nine showtimes dated February, all summer.
+      //
+      // Such a row is emitted as a bare CLOSED rather than skipped. Skipping
+      // writes nothing, and the wiki keeps rows until something replaces
+      // them, so the stale showtimes would simply sit there for good. One
+      // CLOSED clears them; after that the value stops changing and stops
+      // being rewritten, so nothing fakes a heartbeat either. Same treatment
+      // as a retired Nigloland ride.
+      const age = signageRowAge(entry, nowMs);
+      if (age !== null && age > MAX_SIGNAGE_AGE_MS) {
+        staleRows++;
+        liveData.push({id: entityId, status: 'CLOSED'} as LiveData);
+        continue;
+      }
+      const ld: LiveData = {id: entityId, status: 'CLOSED'} as LiveData;
+
+      if (entry.showTimes !== null && entry.showTimes !== undefined) {
+        // Show entity
+        if (Array.isArray(entry.showTimes) && entry.showTimes.length > 0) {
+          ld.status = 'OPERATING' as any;
+          ld.showtimes = entry.showTimes.map((time: string) => {
+            // Show times are in "YYYY-MM-DD HH:mm:ss" format in Europe/Berlin
+            return {
+              startTime: this.formatShowTime(time),
+              endTime: null,
+              type: 'Showtime',
+            };
+          });
+        } else {
+          ld.status = 'CLOSED' as any;
+        }
+      } else if (entry.waitTime !== null && entry.waitTime !== undefined) {
+        // Attraction with wait time
+        ld.status = (entry.open ? 'OPERATING' : 'CLOSED') as any;
+        if (entry.open) {
+          ld.queue = {
+            STANDBY: {waitTime: typeof entry.waitTime === 'number' ? entry.waitTime : null},
+          };
+        }
+      } else if (entry.open !== null && entry.open !== undefined) {
+        // Entity with just open/closed status
+        ld.status = (entry.open ? 'OPERATING' : 'CLOSED') as any;
+      }
+
+      liveData.push(ld);
+    }
+
+    // Every row going stale at once means the feed stopped, not that the
+    // estate retired overnight. The output is still safe — everything reads
+    // CLOSED — but it is worth saying out loud rather than inferring from a
+    // park that has quietly gone dark.
+    if (staleRows > 0 && staleRows === liveData.length) {
+      console.error(
+        `[Phantasialand] every signage row (${staleRows}) is older than ${MAX_SIGNAGE_AGE_MS / 86400000}d — the feed has probably stopped updating`,
+      );
+    }
+
+    return liveData;
+  }
+
+  /**
+   * Format a show time string ("YYYY-MM-DD HH:mm:ss") from Europe/Berlin
+   * into an ISO 8601 string with correct timezone offset.
+   */
+  private formatShowTime(timeStr: string): string {
+    // timeStr is "YYYY-MM-DD HH:mm:ss" in Europe/Berlin local time
+    const dateStr = timeStr.substring(0, 10); // "YYYY-MM-DD"
+    const timePart = timeStr.substring(11);   // "HH:mm:ss"
+    return constructDateTime(dateStr, timePart, this.timezone);
+  }
+
+  protected async buildSchedules(): Promise<EntitySchedule[]> {
+    const [calendar, parkInfos] = await Promise.all([
+      this.getCalendarJSON(),
+      this.getParkInfos(),
+    ]);
+    const scheduleEntries: any[] = [];
+
+    for (const event of calendar) {
+      const title = event.title || '';
+
+      // Skip "closed" entries
+      if (title.toLowerCase().includes('closed')) continue;
+
+      // Parse hours from title
+      const hours = this.parseHours(title);
+      if (!hours) continue;
+
+      // Calendar may have days_selected array or a single date field
+      const dates: string[] = [];
+      if (event.days_selected && Array.isArray(event.days_selected)) {
+        dates.push(...event.days_selected.filter(Boolean));
+      } else if (event.date) {
+        dates.push(event.date);
+      }
+
+      for (const dateStr of dates) {
+        const openingTime = constructDateTime(dateStr, hours.open, this.timezone);
+        const closingTime = constructDateTime(dateStr, hours.close, this.timezone);
+
+        scheduleEntries.push({
+          date: dateStr,
+          type: 'OPERATING',
+          openingTime,
+          closingTime,
+        });
+      }
+    }
+
+    // Apply live override for today's closing time from park-infos API
+    if (parkInfos?.close) {
+      const today = formatDate(new Date(), this.timezone);
+      const todayIdx = scheduleEntries.findIndex((e: any) => e.date === today);
+      if (todayIdx >= 0) {
+        // parkInfos.close is "YYYY-MM-DD HH:mm:ss" in local time
+        const closeParts = parkInfos.close.split(' ');
+        if (closeParts.length === 2 && closeParts[0] === today) {
+          const liveClose = constructDateTime(today, closeParts[1], this.timezone);
+          // Only override if live closing is after the calendar opening
+          if (liveClose > scheduleEntries[todayIdx].openingTime) {
+            scheduleEntries[todayIdx].closingTime = liveClose;
+          }
+        }
+      }
+    }
+
+    return [{
+      id: 'phantasialand',
+      schedule: scheduleEntries,
+    } as EntitySchedule];
+  }
+
+  /**
+   * Parse opening hours from a title string.
+   * Supports two formats:
+   * - AM/PM: "09 a.m. until 06 p.m."
+   * - 24h: "11:00 – 20:00" (or with regular dash)
+   */
+  private parseHours(title: string): {open: string; close: string} | null {
+    // Try AM/PM format: "09 a.m. until 06 p.m."
+    const ampmMatch = title.match(/(\d{1,2})\s*a\.m\.\s*until\s*(\d{1,2})\s*p\.m\./i);
+    if (ampmMatch) {
+      const openHour = parseInt(ampmMatch[1], 10);
+      const closeHour = parseInt(ampmMatch[2], 10) + 12;
+      return {
+        open: String(openHour).padStart(2, '0') + ':00',
+        close: String(closeHour).padStart(2, '0') + ':00',
+      };
+    }
+
+    // Try AM/AM format: "09 a.m. until 11 a.m."
+    const amamMatch = title.match(/(\d{1,2})\s*a\.m\.\s*until\s*(\d{1,2})\s*a\.m\./i);
+    if (amamMatch) {
+      const openHour = parseInt(amamMatch[1], 10);
+      const closeHour = parseInt(amamMatch[2], 10);
+      return {
+        open: String(openHour).padStart(2, '0') + ':00',
+        close: String(closeHour).padStart(2, '0') + ':00',
+      };
+    }
+
+    // Try PM/PM format: "12 p.m. until 08 p.m."
+    const pmpmMatch = title.match(/(\d{1,2})\s*p\.m\.\s*until\s*(\d{1,2})\s*p\.m\./i);
+    if (pmpmMatch) {
+      let openHour = parseInt(pmpmMatch[1], 10);
+      let closeHour = parseInt(pmpmMatch[2], 10);
+      if (openHour !== 12) openHour += 12;
+      if (closeHour !== 12) closeHour += 12;
+      return {
+        open: String(openHour).padStart(2, '0') + ':00',
+        close: String(closeHour).padStart(2, '0') + ':00',
+      };
+    }
+
+    // Try 24h format: "11:00 – 20:00" (en-dash or regular dash)
+    const h24Match = title.match(/(\d{1,2}:\d{2})\s*[–\-]\s*(\d{1,2}:\d{2})/);
+    if (h24Match) {
+      const openTime = h24Match[1].padStart(5, '0');
+      const closeTime = h24Match[2].padStart(5, '0');
+      return {open: openTime, close: closeTime};
+    }
+
+    return null;
+  }
+}

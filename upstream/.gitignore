@@ -1,0 +1,45 @@
+node_modules
+docs
+.env
+.vscode
+.idea
+.cursor
+dist/
+coverage/
+datacache/
+
+# SQLite cache database + WAL/SHM files
+cache.sqlite
+cache.sqlite-wal
+cache.sqlite-shm
+
+# HAR session dumps (API captures)
+*.har
+
+# Comparison snapshots (local only)
+snapshots/
+
+# Temporary files
+testout_*
+temp*.json
+temp*.js
+entity-map-viewer.html
+
+# Claude Code local settings
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# opencode local config
+opencode.json
+
+# Ad-hoc log captures
+output.log
+
+# Local utility scripts
+scripts/
+
+# Specs/plans (local only, not committed)
+VQUEUE_FRAMEWORK_SPEC.md
+
+# Dependency install lock, left behind only if a container is killed mid-install
+.parksapi-deps.lock/

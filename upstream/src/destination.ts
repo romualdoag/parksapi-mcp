@@ -1,0 +1,1451 @@
+import {LiveData, Entity, EntitySchedule, LocalisedString, LanguageCode, LiveQueue, ReturnTimeState, BoardingGroupState} from "@themeparks/typelib";
+import {trace} from "./tracing.js";
+import {reusable} from "./promiseReuse.js";
+import {loadProxyConfig, hasProxyConfig, type ProxyConfig} from "./proxy.js";
+import {inject} from "./injector.js";
+import {type HTTPObj, HttpQueue, http} from "./http.js";
+import {cache, CacheLib} from "./cache.js";
+import {LIVE_ENTITY_RETIREMENT_FRAGMENT} from "./cacheKeys.js";
+import {VQueueBuilder} from "./virtualQueue/builder.js";
+import {calculateReturnWindow} from "./virtualQueue/timeWindows.js";
+import {formatInTimezone} from "./datetime.js";
+import {stripHtmlTags, decodeHtmlEntities} from "./htmlUtils.js";
+
+/**
+ * Per-entity bookkeeping for the live-entity retirement gate. `misses` counts
+ * consecutive absences from successful builds; `retiredAt` is set once a close
+ * has been emitted, marking the id as settled rather than fresh evidence.
+ */
+interface LiveEntityRetirementState {
+  seenAt: number;
+  misses: number;
+  retiredAt?: number;
+}
+
+/**
+ * Patterns for promotional/status text appended or prepended to entity names.
+ * Applied after HTML stripping and entity decoding.
+ */
+const NAME_SUFFIX_PATTERNS = [
+  // Suffixes: " - Temporarily Closed", " – NOW OPEN!", etc.
+  /\s*[-–—]\s*temporarily closed[!]?$/i,
+  /\s*[-–—]\s*closed(?:\s+for\s+the\s+season)?[!]?$/i,
+  /\s*[-–—]\s*coming (?:soon|spring|summer|fall|winter|autumn)\s*\d{0,4}[!]?$/i,
+  /\s*[-–—]\s*now open[!]?$/i,
+  /\s*[-–—]\s*new[!]?$/i,
+  /\s*[-–—]\s*opening\s+(?:\w+\s+)?\d{1,4}[!]?$/i,
+  /\s*[-–—]\s*opens\s+\w+\s+\d{1,2},?\s*\d{0,4}[!]?$/i,
+];
+const NAME_PREFIX_PATTERNS = [
+  // Bracketed status prefixes: "[Unavailable] WaterWorld™", "[Temporarily unavailable] Ride Name"
+  /^\[(?:temporarily\s+)?unavailable\]\s*/i,
+  /^\[(?:closed|coming soon|new|opening soon)\]\s*/i,
+  // Prefixes: "NEW! Dolphin Trainer Talk", "ALL-New Show! When the Pages Turn"
+  // Only strip when followed by "!" to avoid false positives
+  /^(?:all-)?new!?\s+show!\s+/i,
+  /^new!\s+/i,
+];
+
+/** Strip HTML tags, decode entities, and remove promotional/status affixes */
+function sanitizeEntityName(name: string): string {
+  let clean = decodeHtmlEntities(stripHtmlTags(name)).trim();
+  for (const pattern of NAME_SUFFIX_PATTERNS) {
+    clean = clean.replace(pattern, '');
+  }
+  for (const pattern of NAME_PREFIX_PATTERNS) {
+    clean = clean.replace(pattern, '');
+  }
+  return clean.trim();
+}
+
+/**
+ * Remove keys whose value is `undefined` anywhere in the object graph.
+ * Mutates in place. Arrays and nulls pass through unchanged.
+ *
+ * The collector's hashObject() refuses `undefined` values — a parity with
+ * JSON, where `{a: undefined}` serialises to `{}`. Parks occasionally leak
+ * undefined via patterns like `{waitTime: cond ? n : undefined}` or
+ * `location: {lat, lng: maybeNumber}`. Scrubbing at the framework boundary
+ * means every park's output is hash-safe without each one needing to
+ * remember to coerce.
+ */
+function stripUndefinedDeep(value: unknown): void {
+  if (value == null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) stripUndefinedDeep(item);
+    return;
+  }
+  const obj = value as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    const v = obj[key];
+    if (v === undefined) {
+      delete obj[key];
+    } else if (v !== null && typeof v === 'object') {
+      stripUndefinedDeep(v);
+    }
+  }
+}
+
+export type DestinationConstructor = {
+  config?: {[key: string]: string | string[]};
+};
+
+/**
+ * Configuration for mapping source data to Entity objects
+ */
+export type EntityMapperConfig<T> = {
+  /** Field name or extractor function for entity ID */
+  idField: keyof T | ((item: T) => string | number);
+
+  /** Field name or extractor function for entity name (can return string or multi-language object) */
+  nameField: keyof T | ((item: T) => LocalisedString);
+
+  /** Entity type (DESTINATION, PARK, ATTRACTION, SHOW, RESTAURANT, etc.) */
+  entityType: Entity['entityType'];
+
+  /** Field name or extractor function for parent entity ID */
+  parentIdField?: keyof T | ((item: T) => string | number | undefined);
+
+  /** Location field mapping (latitude/longitude) */
+  locationFields?: {
+    lat: keyof T | ((item: T) => number | undefined);
+    lng: keyof T | ((item: T) => number | undefined);
+  };
+
+  /** Timezone for the entity */
+  timezone: string;
+
+  /** Destination ID this entity belongs to */
+  destinationId: string;
+
+  /** Optional filter function to exclude items */
+  filter?: (item: T) => boolean;
+
+  /** Optional transform function for post-processing */
+  transform?: (entity: Entity, sourceItem: T) => Entity;
+};
+
+// Base class for all destinations
+// Hop-by-hop / transport-managed headers that must not be forwarded to a
+// target through Scrapfly — they describe the connection to the proxy, not the
+// target request, and forwarding them corrupts it.
+const SCRAPFLY_SKIP_HEADERS = new Set([
+  'host',
+  'content-length',
+  'connection',
+  'keep-alive',
+  'transfer-encoding',
+  'accept-encoding',
+]);
+
+export abstract class Destination {
+  // Global proxy config — loaded once from GLOBAL_* env vars, shared across all destinations
+  private static globalProxyConfig: ProxyConfig | null = null;
+  private static globalProxiesChecked = false;
+
+  // Per-instance proxy config. Auto-populated from GLOBAL_* and {PREFIX}_* env vars
+  // at construction / addConfigPrefix time. Consumers can also assign directly.
+  proxyConfig: ProxyConfig | null = null;
+
+  // Per-instance HTTP queue. The @http decorator routes this destination's
+  // requests through its own queue so one slow / failing park doesn't block
+  // the rest. Subclasses can override rate-limit behaviour by assigning a
+  // different HttpQueue in their constructor.
+  public readonly httpQueue: HttpQueue = new HttpQueue();
+
+  constructor(options?: DestinationConstructor) {
+    // Apply any configuration options passed in
+    if (options?.config) {
+      this.config = options.config;
+    }
+
+    // Load global proxy config once (first destination instantiation)
+    if (!Destination.globalProxiesChecked) {
+      Destination.globalProxiesChecked = true;
+      const globalConfig = loadProxyConfig(['GLOBAL']);
+      if (hasProxyConfig(globalConfig)) {
+        Destination.globalProxyConfig = globalConfig;
+        console.log('🔌 Global proxy support enabled');
+      }
+    }
+
+    // Apply global proxy config to this instance
+    if (Destination.globalProxyConfig) {
+      this.proxyConfig = {...Destination.globalProxyConfig};
+    }
+  }
+
+  // Configuration options for the destination
+  config: {[key: string]: string | string[]} = {};
+
+  /**
+   * Default language for localized strings
+   * Can be overridden by subclasses or via {PREFIX}_LANGUAGE env var with @config decorator
+   * @default 'en'
+   */
+  language: LanguageCode = 'en';
+
+  /**
+   * Timezone for this destination.
+   * Subclasses should override this with the park's local timezone.
+   * Used by virtual queue helpers to format dates in the park's timezone.
+   * @default 'UTC'
+   */
+  timezone: string = 'UTC';
+
+  /**
+   * Whether this destination supports a real-time live data stream.
+   * Parks with WebSocket or database sync feeds set this to true.
+   * The collector checks this to decide whether to run a stream loop.
+   * @default false
+   */
+  hasLiveStream: boolean = false;
+
+  /**
+   * Opt out of the collapsed-entity-list guard in {@link getEntities}.
+   *
+   * Only for a destination that legitimately publishes no attractions,
+   * restaurants or shows — a listing that exists to carry opening hours, say.
+   * A destination that normally has content and simply lost it upstream must
+   * NOT set this: the whole point of the guard is that losing everything looks
+   * identical to having nothing.
+   *
+   * @default false
+   */
+  protected allowEmptyEntityList: boolean = false;
+
+  /**
+   * Opt-in: force-close a previously-live entity once it has been absent
+   * from a full buildLiveData() snapshot for longer than
+   * {@link liveEntityRetirementMs}.
+   *
+   * The collector is upsert-only with no delete path, so simply omitting a
+   * retired entity from buildLiveData() output achieves nothing — the last
+   * value sits there indefinitely (see nigloland.ts RIDE_RETIREMENT_MS for
+   * the same trap on a wait-time signal). Confirmed independently on two
+   * park modules: a seasonal show run ends, the entity leaves the upstream
+   * feed entirely, and its live row freezes mid-run — 50+ days OPERATING on
+   * one, 17+ days on another (parksapi #74, #83).
+   *
+   * Off by default. A destination whose buildLiveData() legitimately omits
+   * entities for unrelated reasons (a genuinely partial feed, a bug) would
+   * have them wrongly force-closed, so this only applies where the pattern
+   * has actually been confirmed. Only ever applied to a full snapshot
+   * (`scope` undefined) — a partial/streaming build's absentees carry no
+   * meaning and are never gated.
+   *
+   * @default false
+   */
+  protected retireMissingLiveEntities: boolean = false;
+
+  /**
+   * How long an entity may be missing from a full buildLiveData() snapshot
+   * before {@link retireMissingLiveEntities} presumes it retired and
+   * force-closes it. Conservative default: the confirmed real-world cases
+   * were stale 17 and 50+ days, so a week already improves on both by an
+   * order of magnitude while tolerating a normal multi-day show hiatus.
+   * Override per-destination if evidence supports a tighter or looser
+   * window.
+   *
+   * @default 7 days
+   */
+  protected liveEntityRetirementMs: number = 7 * 24 * 60 * 60 * 1000;
+
+  /**
+   * How many consecutive *successful* snapshots an entity must be absent from
+   * before it can retire, on top of {@link liveEntityRetirementMs}.
+   *
+   * Age alone is wall-clock, and nothing advances it while the source is
+   * down: a proxy block, a container stop or a deploy gap longer than the
+   * window all leave every timestamp stale, so the first poll to succeed
+   * afterwards would retire everything missing from that one sample on the
+   * strength of a single observation. Requiring the absence to repeat means
+   * a close always rests on several builds.
+   *
+   * This also sets how long a collapse must persist before the degraded-feed
+   * guard arms, which couples it to the collector's polling interval across
+   * repo boundaries: `liveEntityRetirementMinMisses × pollInterval` has to
+   * land comfortably inside {@link liveEntityRetirementMs}, or the guard
+   * cannot arm before the age window opens and a mistimed recovery is closed
+   * silently again. Universal is the tightest case at 3 × 45 minutes against
+   * a four hour window, a 1.78x margin; the boundary sits at a 80 minute
+   * poll. Raising the collector's closed-park interval past that, or dropping
+   * a destination's window below 135 minutes, reopens the hole.
+   *
+   * @default 3
+   */
+  protected liveEntityRetirementMinMisses: number = 3;
+
+  /**
+   * Fraction of tracked entities that may retire in one snapshot before the
+   * gate assumes the feed is degraded rather than the entities retired.
+   *
+   * A source can return a well-formed but gutted payload — an empty array, a
+   * CDN stub, a partial regeneration — which parses cleanly and so never
+   * throws. Retiring on that publishes a confident CLOSED for a park that is
+   * open. Mass disappearance is far more often a broken feed than a mass
+   * retirement, so past this share the gate declines to act and warns.
+   *
+   * Measured against raw absence rather than against the entities that are
+   * eligible to close, because eligibility needs the age window to elapse and
+   * a guard that waited for it could not see a collapse until the collapse
+   * had already outlived it.
+   *
+   * Known limit: this catches simultaneous collapses, not staggered ones. A
+   * source shedding rows in waves, with a retirement window between them,
+   * keeps every wave under the threshold and is genuinely indistinguishable
+   * from progressive retirement without venue-level grouping. Every
+   * simultaneity-based guard shares this, the collector's own bulk-close
+   * guard included. Grouping the fraction per `parkId` is the refinement if
+   * it ever bites in practice.
+   *
+   * @default 0.5
+   */
+  protected liveEntityRetirementMaxFraction: number = 0.5;
+
+  /**
+   * Floor below which {@link liveEntityRetirementMaxFraction} does not apply.
+   * A destination tracking a handful of entities can legitimately retire most
+   * of them at once; the proportional guard is aimed at collapses measured in
+   * dozens.
+   *
+   * @default 5
+   */
+  protected liveEntityRetirementMinBulk: number = 5;
+
+  /**
+   * How long a retired entity keeps having its CLOSED row re-appended before
+   * the gate forgets it entirely.
+   *
+   * The repeat exists so a close that was built but never delivered is not
+   * lost for good. It cannot run forever, though: a permanently dead id would
+   * otherwise count as fresh evidence of a collapse on every future build, and
+   * enough of them accumulated across seasons would trip
+   * {@link liveEntityRetirementMaxFraction} for good and silently disable the
+   * gate. A few days covers any rejected batch or dead process by orders of
+   * magnitude, and bounds the pile.
+   *
+   * @default 3 days
+   */
+  protected liveEntityRetirementRepeatMs: number = 3 * 24 * 60 * 60 * 1000;
+
+  /**
+   * Optional cache key prefix for all cached methods.
+   * When set, this prefix is prepended to all cache keys, preventing cache collisions
+   * when multiple instances of the same base class exist (e.g., multiple parks using the same framework).
+   *
+   * Can be set directly as a string property, or implement getCacheKeyPrefix() method for dynamic prefixes.
+   *
+   * @example
+   * ```typescript
+   * class MyPark extends Destination {
+   *   constructor(options) {
+   *     super(options);
+   *     this.cacheKeyPrefix = `mypark:${this.parkId}`;
+   *   }
+   * }
+   * ```
+   */
+  cacheKeyPrefix?: string;
+
+  /**
+   * Optional method to dynamically generate a cache key prefix.
+   * If implemented, this takes precedence over the cacheKeyPrefix property.
+   * Can return a string or Promise<string>.
+   *
+   * @example
+   * ```typescript
+   * class MyPark extends Destination {
+   *   getCacheKeyPrefix() {
+   *     return `mypark:${this.parkId}`;
+   *   }
+   * }
+   * ```
+   */
+  getCacheKeyPrefix?(): string | Promise<string>;
+
+  /**
+   * Reset global proxy state. Used by tests only.
+   * @internal
+   */
+  static resetGlobalProxyState() {
+    Destination.globalProxyConfig = null;
+    Destination.globalProxiesChecked = false;
+  }
+
+  /**
+   * Add a prefix to use when looking up config values from environment variables
+   * or config object. This allows multiple destinations to co-exist in the same
+   * environment without clashing on config keys.
+   * @param prefix Prefix to add to config lookups (e.g. 'UNIVERSAL' to check UNIVERSAL_<KEY> env vars)
+   */
+  addConfigPrefix(prefix: string) {
+    if (!Array.isArray(this.config.configPrefixes)) {
+      this.config.configPrefixes = [];
+    }
+    (this.config.configPrefixes as string[]).push(prefix);
+
+    // Auto-load per-destination proxy config from env vars for this prefix.
+    // If {PREFIX}_CRAWLBASE / _SCRAPFLY / _BASICPROXY is set, merge into proxyConfig.
+    // Per-destination overrides global. No opt-in required — absence of env vars
+    // simply leaves proxyConfig inheriting from global (or null).
+    const destConfig = loadProxyConfig([prefix]);
+    if (hasProxyConfig(destConfig)) {
+      this.proxyConfig = {...(this.proxyConfig || {}), ...destConfig};
+    }
+  }
+
+  /**
+   * Inject proxy settings into HTTP requests.
+   * Runs last (priority 999) so all auth/header injectors fire before
+   * the URL is rewritten to point at the proxy service.
+   */
+  @inject({eventName: 'httpRequest', priority: 999})
+  async _injectProxy(req: HTTPObj): Promise<void> {
+    if (!this.proxyConfig) return;
+
+    // Apply in priority order: CrawlBase > Scrapfly > BasicProxy
+    if (this.proxyConfig.crawlbase) {
+      const originalUrl = req.url;
+      req.url = `https://api.crawlbase.com/?url=${encodeURIComponent(originalUrl)}&token=${this.proxyConfig.crawlbase.apikey}`;
+      return;
+    }
+
+    if (this.proxyConfig.scrapfly) {
+      const sf = this.proxyConfig.scrapfly;
+
+      // Fold the request's own query params into the target URL so they survive
+      // proxying — Scrapfly fetches the `url` param verbatim and would otherwise
+      // drop them (and they'd leak onto the Scrapfly call via buildUrl()).
+      const targetUrl = new URL(req.url);
+      if (req.queryParams) {
+        for (const [k, v] of Object.entries(req.queryParams)) targetUrl.searchParams.append(k, v);
+      }
+
+      const sfParams: Record<string, string> = {url: targetUrl.toString(), key: sf.apikey};
+      if (sf.params) Object.assign(sfParams, sf.params);
+
+      // Scrapfly's REST endpoint only sends headers/method/body to the TARGET
+      // when passed as explicit params — it does not forward the inbound
+      // request's own headers or body. Without this, APIs that authenticate via
+      // custom headers (e.g. an x-api-key header) fail with 401 through
+      // Scrapfly. Forward the request's headers (minus hop-by-hop), method, and
+      // body so authenticated requests behave the same as direct.
+      if (req.headers) {
+        for (const [name, value] of Object.entries(req.headers)) {
+          if (value == null) continue;
+          if (SCRAPFLY_SKIP_HEADERS.has(name.toLowerCase())) continue;
+          sfParams[`headers[${name}]`] = String(value);
+        }
+      }
+      // buildHeaders() adds Content-Type/Accept for options.json requests; those
+      // are applied at send time and aren't in req.headers, so forward them too
+      // — otherwise a proxied JSON POST reaches the target without Content-Type.
+      // Skip if the request already set them explicitly (case-insensitive).
+      if (req.options?.json) {
+        const hasHeader = (h: string) =>
+          Object.keys(req.headers ?? {}).some((k) => k.toLowerCase() === h);
+        if (!hasHeader('content-type')) sfParams['headers[Content-Type]'] = 'application/json';
+        if (!hasHeader('accept')) sfParams['headers[Accept]'] = 'application/json';
+      }
+      const method = (req.method || 'GET').toUpperCase();
+      if (method !== 'GET') {
+        sfParams.method = method;
+        if (req.body != null) {
+          sfParams.body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+        }
+        // The call TO Scrapfly is itself a GET; Scrapfly performs the
+        // method/body against the target.
+        req.method = 'GET';
+        req.body = undefined;
+      }
+
+      // Keep the Scrapfly key, forwarded auth headers and body in queryParams
+      // (merged into the final URL only at buildUrl() time) rather than baking
+      // them into req.url — trace/retry logging prints req.url verbatim, so this
+      // keeps secrets out of the logs. Auth now travels as params, so clear the
+      // request headers too (they'd otherwise be sent to api.scrapfly.io).
+      req.headers = {};
+      req.url = 'https://api.scrapfly.io/scrape';
+      req.queryParams = sfParams;
+      return;
+    }
+
+    if (this.proxyConfig.basicProxy) {
+      (req as any).proxyUrl = this.proxyConfig.basicProxy.proxy;
+    }
+  }
+
+  /**
+   * Unwrap proxy responses (e.g., Scrapfly wraps responses in JSON).
+   * Runs first (priority -999) so downstream response handlers see
+   * the unwrapped response, not the proxy envelope.
+   */
+  @inject({eventName: 'httpResponse', priority: -999})
+  async _unwrapProxyResponse(req: HTTPObj): Promise<void> {
+    if (!this.proxyConfig?.scrapfly || !req.response) return;
+
+    try {
+      const body = await req.response.clone().json();
+      if (body.result && body.result.content !== undefined) {
+        req.response = new Response(body.result.content, {
+          status: body.result.status_code || 200,
+          headers: body.result.response_headers || {},
+        });
+      }
+    } catch {
+      // Not a Scrapfly response or failed to parse — leave as-is
+    }
+  }
+
+  /**
+   * Resolve entity hierarchy relationships (parkId and destinationId)
+   *
+   * Walks the parent chain for each entity to correctly set parkId and destinationId
+   * based on ancestor types. This handles edge cases like:
+   * - Attractions at destinations (no park) vs attractions at parks
+   * - Hotels inside parks vs hotels at destinations
+   * - Transport between parks vs transport within parks
+   *
+   * Rules:
+   * - DESTINATION entities: no parent, no parkId, destinationId = self
+   * - PARK entities: parent should be DESTINATION, no parkId
+   * - All other entities: parkId = first PARK ancestor (if any), destinationId = first DESTINATION ancestor
+   *
+   * Validation:
+   * - Throws error if circular parent references detected
+   * - Throws error if any entity has no DESTINATION in parent chain
+   * - Throws error if any PARK has no DESTINATION parent
+   *
+   * @param entities Array of entities to resolve
+   * @returns Same array with parkId and destinationId correctly set
+   * @throws {Error} If circular references or missing destination in hierarchy
+   *
+   * @example
+   * ```typescript
+   * async getEntities(): Promise<Entity[]> {
+   *   const entities = [
+   *     ...this.mapEntities(parks, ...),
+   *     ...this.mapEntities(attractions, ...),
+   *   ];
+   *   return this.resolveEntityHierarchy(entities);
+   * }
+   * ```
+   */
+  protected resolveEntityHierarchy(entities: Entity[]): Entity[] {
+    // Build lookup map for fast parent traversal
+    const entityMap = new Map<string, Entity>();
+    entities.forEach(e => entityMap.set(e.id, e));
+
+    /**
+     * Walk up parent chain to find first ancestor of given type(s)
+     * Detects circular references
+     */
+    const findAncestor = (
+      entityId: string,
+      types: Entity['entityType'][]
+    ): Entity | undefined => {
+      let current = entityMap.get(entityId);
+      const visited = new Set<string>();
+
+      while (current) {
+        // Detect circular references
+        if (visited.has(current.id)) {
+          throw new Error(
+            `Circular parent reference detected in entity hierarchy for ${entityId}`
+          );
+        }
+        visited.add(current.id);
+
+        // Check if this is the type we're looking for
+        if (types.includes(current.entityType)) {
+          return current;
+        }
+
+        // Move to parent
+        if (!current.parentId) break;
+        current = entityMap.get(current.parentId);
+      }
+
+      return undefined;
+    };
+
+    // Resolve hierarchy for each entity
+    entities.forEach(entity => {
+      switch (entity.entityType) {
+        case 'DESTINATION':
+          // Destinations are roots - no parents
+          delete entity.parentId;
+          delete entity.parkId;
+          delete entity.destinationId;
+          break;
+
+        case 'PARK':
+          // Parks should have destination parent, no parkId
+          delete entity.parkId;
+          const parkDestination = findAncestor(entity.id, ['DESTINATION']);
+          if (parkDestination) {
+            entity.destinationId = parkDestination.id;
+          } else if (!entity.destinationId) {
+            throw new Error(
+              `Park entity ${entity.id} (${entity.name}) has no DESTINATION in parent chain. ` +
+              `All parks must have a destination parent.`
+            );
+          }
+          break;
+
+        default:
+          // All other entities - find park (optional) and destination (required)
+          const park = findAncestor(entity.id, ['PARK']);
+          const destination = findAncestor(entity.id, ['DESTINATION']);
+
+          if (park) {
+            entity.parkId = park.id;
+          } else {
+            delete entity.parkId;
+          }
+          entity.destinationId = destination?.id || entity.destinationId;
+
+          // Validation: all entities must have a destination
+          if (!entity.destinationId) {
+            throw new Error(
+              `Entity ${entity.id} (${entity.name}, type: ${entity.entityType}) has no DESTINATION in parent chain. ` +
+              `All entities must be part of a destination hierarchy.`
+            );
+          }
+          break;
+      }
+    });
+
+    return entities;
+  }
+
+  /**
+   * Map array of source items to Entity objects
+   *
+   * Helper method to reduce boilerplate when converting API responses to Entity objects.
+   * Provides declarative mapping configuration instead of manual object construction.
+   *
+   * Note: This method does NOT set parkId automatically. Use resolveEntityHierarchy()
+   * after mapping all entities to correctly populate parkId and destinationId based on
+   * the parent chain.
+   *
+   * @example
+   * ```typescript
+   * const entities = this.mapEntities(apiRides, {
+   *   idField: 'Id',
+   *   nameField: 'MblDisplayName',
+   *   entityType: 'ATTRACTION',
+   *   parentIdField: 'VenueId',
+   *   locationFields: { lat: 'Latitude', lng: 'Longitude' },
+   *   destinationId: 'universalorlando',
+   *   timezone: 'America/New_York',
+   *   filter: (ride) => ride.IsActive === true,
+   * });
+   * ```
+   */
+  protected mapEntities<T>(
+    items: T[],
+    config: EntityMapperConfig<T>
+  ): Entity[] {
+    // Helper: Extract value from a field name or extractor function
+    const getValue = <R>(item: T, field: keyof T | ((item: T) => R)): R => {
+      return typeof field === 'function' ? field(item) : (item[field] as any);
+    };
+
+    return items
+      // Apply filter if provided
+      .filter(item => config.filter?.(item) ?? true)
+
+      // Map to entities
+      .map(item => {
+        // Build base entity with required fields
+        const nameValue = getValue(item, config.nameField);
+        const entity: Entity = {
+          id: String(getValue(item, config.idField)),
+          name: typeof nameValue === 'string' ? nameValue : nameValue as LocalisedString,
+          entityType: config.entityType,
+          destinationId: config.destinationId,
+          timezone: config.timezone,
+        } as Entity;
+
+        // Add parent relationship if specified
+        if (config.parentIdField) {
+          const parentId = getValue(item, config.parentIdField);
+          if (parentId !== undefined && parentId !== null) {
+            entity.parentId = String(parentId);
+          }
+        }
+
+        // Add location if fields specified and values exist
+        if (config.locationFields) {
+          const lat = getValue(item, config.locationFields.lat);
+          const lng = getValue(item, config.locationFields.lng);
+
+          if (lat !== undefined && lat !== null && lng !== undefined && lng !== null) {
+            entity.location = {
+              latitude: Number(lat),
+              longitude: Number(lng),
+            };
+          }
+        }
+
+        // Apply custom transform if provided
+        return config.transform ? config.transform(entity, item) : entity;
+      });
+  }
+
+  /**
+   * Get localized string value with fallback logic
+   *
+   * Handles both simple strings and multi-language objects. For multi-language objects,
+   * uses intelligent fallback: tries exact match, then base language (en-gb -> en),
+   * then fallback language, then first available.
+   *
+   * @param value LocalisedString (string or multi-language object)
+   * @param language Preferred language code (defaults to instance language config)
+   * @param fallbackLanguage Fallback language if preferred unavailable (defaults to 'en')
+   * @returns Localized string value
+   *
+   * @example
+   * ```typescript
+   * // Simple string - returns as-is
+   * this.getLocalizedString("Space Mountain") // => "Space Mountain"
+   *
+   * // Multi-language object with exact match
+   * this.getLocalizedString({ en: "Space Mountain", fr: "Space Mountain" }, "fr")
+   * // => "Space Mountain"
+   *
+   * // Multi-language with base language fallback
+   * this.getLocalizedString({ en: "Space Mountain" }, "en-gb")
+   * // => "Space Mountain" (falls back to 'en')
+   * ```
+   */
+  protected getLocalizedString(
+    value: LocalisedString,
+    language?: LanguageCode,
+    fallbackLanguage: LanguageCode = 'en'
+  ): string {
+    // Simple string case
+    if (typeof value === 'string') {
+      return value;
+    }
+
+    // Use instance language config if not specified
+    const preferredLanguage = language || this.language;
+
+    // Try exact match
+    if (value[preferredLanguage]) {
+      return value[preferredLanguage]!;
+    }
+
+    // Try base language (en-gb -> en)
+    const baseLanguage = preferredLanguage.split('-')[0] as LanguageCode;
+    if (value[baseLanguage]) {
+      return value[baseLanguage]!;
+    }
+
+    // Try fallback language
+    if (value[fallbackLanguage]) {
+      return value[fallbackLanguage]!;
+    }
+
+    // Return first available language
+    const values = Object.values(value) as (string | undefined)[];
+    const firstValue = values.find(v => v !== undefined);
+    return firstValue || '';
+  }
+
+  /**
+   * Helper to build return time queue data
+   *
+   * Constructs a RETURN_TIME queue object with proper formatting.
+   * Automatically formats dates in the destination's timezone.
+   *
+   * @param state Queue state (AVAILABLE, TEMP_FULL, or FINISHED)
+   * @param returnStart Start time of return window (Date or ISO string)
+   * @param returnEnd End time of return window (Date or ISO string)
+   * @returns Return time queue object
+   *
+   * @example
+   * ```typescript
+   * // In buildLiveData()
+   * liveData.queue!.RETURN_TIME = this.buildReturnTimeQueue(
+   *   'AVAILABLE',
+   *   new Date('2024-10-15T14:30:00'),
+   *   new Date('2024-10-15T14:45:00')
+   * );
+   * ```
+   */
+  protected buildReturnTimeQueue(
+    state: ReturnTimeState,
+    returnStart: string | Date | null,
+    returnEnd: string | Date | null
+  ): NonNullable<LiveQueue['RETURN_TIME']> {
+    return VQueueBuilder.returnTime()
+      .state(state)
+      .withWindow(
+        returnStart ? this.formatDateInTimezone(returnStart) : null,
+        returnEnd ? this.formatDateInTimezone(returnEnd) : null
+      )
+      .build();
+  }
+
+  /**
+   * Helper to build paid return time queue data
+   *
+   * Constructs a PAID_RETURN_TIME queue object with pricing information.
+   * Automatically formats dates in the destination's timezone.
+   *
+   * @param state Queue state (AVAILABLE, TEMP_FULL, or FINISHED)
+   * @param returnStart Start time of return window (Date or ISO string)
+   * @param returnEnd End time of return window (Date or ISO string)
+   * @param currency Currency code (e.g., 'USD', 'EUR')
+   * @param amountCents Price in cents (e.g., 1500 for $15.00)
+   * @returns Paid return time queue object
+   *
+   * @example
+   * ```typescript
+   * // In buildLiveData() for Lightning Lane/Express Pass
+   * liveData.queue!.PAID_RETURN_TIME = this.buildPaidReturnTimeQueue(
+   *   'AVAILABLE',
+   *   new Date('2024-10-15T14:30:00'),
+   *   null,
+   *   'USD',
+   *   1500
+   * );
+   * ```
+   */
+  protected buildPaidReturnTimeQueue(
+    state: ReturnTimeState,
+    returnStart: string | Date | null,
+    returnEnd: string | Date | null,
+    currency: string,
+    amountCents: number | null
+  ): NonNullable<LiveQueue['PAID_RETURN_TIME']> {
+    return VQueueBuilder.paidReturnTime()
+      .state(state)
+      .withWindow(
+        returnStart ? this.formatDateInTimezone(returnStart) : null,
+        returnEnd ? this.formatDateInTimezone(returnEnd) : null
+      )
+      .withPrice(currency, amountCents)
+      .build();
+  }
+
+  /**
+   * Helper to build boarding group queue data
+   *
+   * Constructs a BOARDING_GROUP queue object with allocation information.
+   * Automatically formats dates in the destination's timezone.
+   *
+   * @param status Boarding group status (AVAILABLE, PAUSED, or CLOSED)
+   * @param options Additional boarding group information
+   * @returns Boarding group queue object
+   *
+   * @example
+   * ```typescript
+   * // In buildLiveData() for Rise of the Resistance
+   * liveData.queue!.BOARDING_GROUP = this.buildBoardingGroupQueue('AVAILABLE', {
+   *   currentGroupStart: 45,
+   *   currentGroupEnd: 60,
+   *   estimatedWait: 30
+   * });
+   * ```
+   */
+  protected buildBoardingGroupQueue(
+    status: BoardingGroupState,
+    options?: {
+      currentGroupStart?: number | null;
+      currentGroupEnd?: number | null;
+      nextAllocationTime?: string | Date | null;
+      estimatedWait?: number | null;
+    }
+  ): NonNullable<LiveQueue['BOARDING_GROUP']> {
+    const builder = VQueueBuilder.boardingGroup().status(status);
+
+    if (options?.currentGroupStart !== undefined && options?.currentGroupEnd !== undefined) {
+      builder.currentGroups(options.currentGroupStart, options.currentGroupEnd);
+    }
+    if (options?.nextAllocationTime) {
+      builder.nextAllocationTime(this.formatDateInTimezone(options.nextAllocationTime));
+    }
+    if (options?.estimatedWait !== undefined) {
+      builder.estimatedWait(options.estimatedWait);
+    }
+
+    return builder.build();
+  }
+
+  /**
+   * Calculate return window based on current wait time
+   *
+   * Common pattern for parks like Efteling where virtual queue window
+   * is calculated as: now + waitTime to now + waitTime + windowDuration
+   *
+   * @param waitMinutes Wait time in minutes to add to base time
+   * @param options Optional configuration
+   * @returns Object with formatted start and end times
+   *
+   * @example
+   * ```typescript
+   * // In buildLiveData() for calculated return windows
+   * const window = this.calculateReturnWindow(45, { windowMinutes: 15 });
+   * liveData.queue!.RETURN_TIME = this.buildReturnTimeQueue(
+   *   'AVAILABLE',
+   *   window.start,
+   *   window.end
+   * );
+   * ```
+   */
+  protected calculateReturnWindow(
+    waitMinutes: number,
+    options?: {
+      baseTime?: Date;
+      windowMinutes?: number;
+    }
+  ): { start: string; end: string } {
+    return calculateReturnWindow({
+      baseTime: options?.baseTime || new Date(),
+      waitMinutes,
+      windowDurationMinutes: options?.windowMinutes || 15,
+      timezone: this.timezone,
+    });
+  }
+
+  /**
+   * Format date in park's timezone for virtual queue times
+   * @private
+   */
+  private formatDateInTimezone(date: string | Date): string {
+    if (typeof date === 'string') {
+      // If the string already has an explicit timezone offset (or trailing Z),
+      // pass it through unchanged. Otherwise, treat it as a naive timestamp
+      // that needs formatting in the park's timezone.
+      if (date.includes('T') && /([+-]\d{2}:?\d{2}|Z)$/.test(date)) {
+        return date;
+      }
+      return formatInTimezone(new Date(date), this.timezone, 'iso');
+    }
+    return formatInTimezone(date, this.timezone, 'iso');
+  }
+
+  /**
+   * Fetch the latest version of an app from the themeparks.wiki appwatch
+   * mirror (Play Store metadata). Used by `getAppwatchVersion()`; subclasses
+   * shouldn't call this directly.
+   */
+  @http({cacheSeconds: 60 * 60 * 12})
+  protected async fetchAppwatchVersion(packageId: string): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `https://api.themeparks.wiki/appwatch/latest/${encodeURIComponent(packageId)}`,
+      options: {json: true},
+    } as HTTPObj;
+  }
+
+  /**
+   * Get the latest published version string of a mobile app, via appwatch.
+   * Returns `fallback` when appwatch is unreachable or doesn't have the
+   * version field. Cached 12h per (subclass, packageId) — invalidate the
+   * cache entry from a response-error handler if the upstream API ever
+   * starts gating on version.
+   *
+   * @example
+   * ```typescript
+   * const v = await this.getAppwatchVersion('com.example.app', this.appVersion);
+   * headers['App-Version'] = v;
+   * ```
+   */
+  @cache({ttlSeconds: 60 * 60 * 12})
+  async getAppwatchVersion(packageId: string, fallback: string = ''): Promise<string> {
+    try {
+      const resp = await this.fetchAppwatchVersion(packageId);
+      const data = await resp.json();
+      return data?.version || fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  /**
+   * Initialize the destination
+   *
+   * This method is called automatically before any data retrieval methods
+   * (getEntities, getLiveData, getSchedules). It runs only once per instance,
+   * even if called multiple times, thanks to @reusable({forever: true}).
+   *
+   * Subclasses should override `_init()` instead of this method.
+   *
+   * @example
+   * ```typescript
+   * class MyPark extends Destination {
+   *   protected async _init() {
+   *     await this.connectToDatabase();
+   *     await this.loadConfig();
+   *   }
+   * }
+   * ```
+   */
+  @reusable({forever: true})
+  protected async init(): Promise<void> {
+    await this._init();
+  }
+
+  /**
+   * Internal initialization hook for subclasses
+   *
+   * Override this method to provide custom initialization logic.
+   * Called once per instance by `init()`.
+   *
+   * @protected
+   */
+  protected async _init(): Promise<void> {
+    // Default: no initialization needed
+  }
+
+  /**
+   * Get all destinations this class supports
+   * @returns {Entity[]} List of destinations
+   */
+  async getDestinations(): Promise<Entity[]> {
+    return [];
+  }
+
+  /**
+   * Get all entities (parks, attractions, dining, shows, hotels) for this destination
+   *
+   * ⚠️ **DO NOT OVERRIDE THIS METHOD** ⚠️
+   *
+   * This method automatically calls init() before fetching entities, and
+   * calls resolveEntityHierarchy() on the returned entities to set parkId
+   * and destinationId based on parent relationships.
+   *
+   * **To provide entities, implement buildEntityList() instead.**
+   *
+   * @final This method is final and should not be overridden.
+   * @returns {Entity[]} List of entities with resolved hierarchy
+   */
+  @trace()
+  async getEntities(): Promise<Entity[]> {
+    await this.init();
+    const destinations = await this.getDestinations();
+    const entities = await this.buildEntityList();
+    // Merge destination entities with built entities, avoiding duplicates
+    const entityIds = new Set(entities.map(e => e.id));
+    const merged = [...destinations.filter(d => !entityIds.has(d.id)), ...entities];
+    const resolved = this.resolveEntityHierarchy(merged);
+
+    this.assertEntityListNotCollapsed(resolved);
+
+    // Default attractionType for ATTRACTION entities that don't specify one
+    for (const entity of resolved) {
+      if (entity.entityType === 'ATTRACTION' && !(entity as any).attractionType) {
+        (entity as any).attractionType = 'RIDE';
+      }
+    }
+
+    // Sanitize entity names:
+    // 1. Strip HTML tags and decode entities (e.g., "Balloon <em>Race</em>")
+    // 2. Remove promotional/status suffixes (e.g., " - Now Open!", " - Temporarily Closed")
+    // If sanitization would produce an empty string (e.g., the entire name was
+    // a promotional pattern), keep the original to avoid losing the entity.
+    for (const entity of resolved) {
+      if (!entity.name) continue;
+      if (typeof entity.name === 'string') {
+        const sanitized = sanitizeEntityName(entity.name);
+        entity.name = sanitized || entity.name;
+      } else {
+        for (const lang of Object.keys(entity.name)) {
+          const val = (entity.name as any)[lang];
+          if (typeof val === 'string') {
+            const sanitized = sanitizeEntityName(val);
+            (entity.name as any)[lang] = sanitized || val;
+          }
+        }
+      }
+    }
+
+    for (const entity of resolved) stripUndefinedDeep(entity);
+    return resolved;
+  }
+
+  /**
+   * Refuse to publish an entity list that contains nothing a guest can visit.
+   *
+   * DESTINATION and PARK rows describe the shape of a resort; they are built
+   * from constants in `getDestinations()` and a handful of literals in
+   * `buildEntityList()`, so they survive an upstream failure that took every
+   * real entity with it. What is left parses cleanly, validates, and reports
+   * success — the harness passed a park showing 3 entities and no live data
+   * for weeks, while every ride it could no longer see queued for deletion
+   * downstream. Two destinations reached that state by different routes on
+   * the same day: one whose POI endpoint answered 200 with an empty list, one
+   * whose rides pages began redirecting and were dropped by a scraper that
+   * treats a failed page as an empty one.
+   *
+   * Throwing is the point. The collector is upsert-only with no delete path of
+   * its own, so a truncated list does not quietly under-report — it proposes
+   * deleting everything missing from it. An error means the poll is skipped and
+   * the last good list stands, which is always the better of the two.
+   *
+   * A destination that genuinely has no content sets
+   * {@link allowEmptyEntityList}.
+   */
+  private assertEntityListNotCollapsed(resolved: Entity[]): void {
+    if (this.allowEmptyEntityList) return;
+    const structural = new Set(['DESTINATION', 'PARK']);
+    if (resolved.some((entity) => !structural.has(entity.entityType as string))) return;
+
+    const shape = resolved.length
+      ? resolved.map((e) => e.entityType).sort().join(', ')
+      : 'nothing at all';
+    throw new Error(
+      `${this.constructor.name}: buildEntityList() produced no attractions, ` +
+      `restaurants or shows — only ${shape}. Refusing to publish a list that ` +
+      `would read as every entity having been removed. Set ` +
+      `allowEmptyEntityList if this destination genuinely has no content.`,
+    );
+  }
+
+  /**
+   * Build the list of entities for this destination
+   *
+   * Subclasses should override this method to return their entities.
+   * The returned entities will automatically have their parkId and destinationId
+   * resolved based on the parent hierarchy.
+   *
+   * @returns {Entity[]} List of entities (hierarchy will be resolved automatically)
+   */
+  protected async buildEntityList(): Promise<Entity[]> {
+    throw new Error("buildEntityList not implemented.");
+  }
+
+  /**
+   * Get live data for all entities in this destination
+   *
+   * ⚠️ **DO NOT OVERRIDE THIS METHOD** ⚠️
+   *
+   * This method automatically calls init() before fetching live data.
+   * If you need to provide post-processing or validation of live data,
+   * consider using the transform pattern in buildLiveData() instead.
+   *
+   * **To provide live data, implement buildLiveData() instead.**
+   *
+   * @final This method is final and should not be overridden.
+   * @param scope Optional set of published entity ids to limit the build to.
+   *   Streaming (push) destinations pass the ids whose source docs changed this
+   *   fire so the build is emit-per-changed-entity rather than a full snapshot.
+   *   Undefined (the default, and all poll/REST destinations) builds everything.
+   *   Passed through to buildLiveData(); subclasses that ignore it stay full-snapshot.
+   * @returns {LiveData[]} List of live data for entities
+   */
+  @trace()
+  async getLiveData(scope?: ReadonlySet<string>): Promise<LiveData[]> {
+    await this.init();
+    let data = await this.buildLiveData(scope);
+    if (this.retireMissingLiveEntities && scope === undefined) {
+      data = await this.applyLiveEntityRetirement(data);
+    }
+    // Sanitise waitTime values — must be a finite number or null/undefined.
+    // Catches bugs like waitTime:"" which crash downstream integer columns.
+    for (const entry of data) {
+      if (entry.queue) {
+        for (const queueType of Object.keys(entry.queue)) {
+          const q = (entry.queue as Record<string, any>)[queueType];
+          if (q && 'waitTime' in q) {
+            const wt = q.waitTime;
+            if (wt != null && (typeof wt !== 'number' || !Number.isFinite(wt))) {
+              q.waitTime = null;
+            }
+          }
+        }
+      }
+    }
+    for (const entry of data) stripUndefinedDeep(entry);
+    return data;
+  }
+
+  /**
+   * Cache key for this destination's {@link retireMissingLiveEntities}
+   * last-seen tracking. Reuses the same prefix resolution the `@cache`
+   * decorator applies, so it lands in this destination's namespace.
+   *
+   * Built from {@link LIVE_ENTITY_RETIREMENT_FRAGMENT}, which is also what
+   * makes `CacheLib.clearByClassName()` step over it. This record is not a
+   * cache: it says whether an id has ever been seen live, and a flush that
+   * dropped it would leave every already-absent id unretireable, freezing
+   * exactly the stale rows a flush is usually reached for. One constant owns
+   * both halves so they cannot drift.
+   */
+  private async liveEntityRetirementCacheKey(): Promise<string> {
+    let prefix: string;
+    if (typeof this.getCacheKeyPrefix === 'function') {
+      const result = this.getCacheKeyPrefix();
+      prefix = result instanceof Promise ? await result : result;
+    } else {
+      prefix = this.cacheKeyPrefix || this.constructor.name;
+    }
+    // Fall back the way the `cacheKeyPrefix` branch and the @cache decorator
+    // already do. An override returning '' would otherwise yield the bare key
+    // `:liveEntityRetirement`, shared by every destination that did it, and
+    // the gate would close entities belonging to another park.
+    return `${prefix || this.constructor.name}${LIVE_ENTITY_RETIREMENT_FRAGMENT}`;
+  }
+
+  /**
+   * Diff a full buildLiveData() snapshot against what previous calls saw.
+   * An entity that was live before and has now been absent both for longer
+   * than {@link liveEntityRetirementMs} and across
+   * {@link liveEntityRetirementMinMisses} consecutive snapshots gets a
+   * synthetic `{id, status: 'CLOSED'}` row appended — a genuine value change,
+   * so the collector's hash-dedup actually writes it and clears the frozen
+   * row. Entities that reappear reset both counters and drop out of
+   * consideration; nothing here mutates entries buildLiveData() returned.
+   *
+   * Two things stop this speaking with more confidence than it has. The
+   * consecutive-miss requirement means no close ever rests on a single
+   * observation, which matters because the age clock keeps running through
+   * an outage while nothing refreshes it. The proportional guard
+   * ({@link liveEntityRetirementMaxFraction}) declines to act at all when so
+   * much of the tracked set has vanished at once that a degraded feed is the
+   * likelier explanation. Both failures are logged rather than silent: a
+   * fabricated CLOSED is indistinguishable from a real one downstream, so
+   * the log line is the only forensic trail.
+   *
+   * The CLOSED row is re-appended on every subsequent build for as long as
+   * the entity stays absent, rather than emitted once and forgotten. That
+   * looks wasteful and is deliberate: nothing here can observe whether a
+   * build was actually delivered, and the send path holds no retry queue of
+   * its own — it diffs the rows in the *current* build against the last
+   * committed hashes. A close emitted once and dropped (batch rejected, push
+   * skipped, process died between build and POST) would therefore be lost
+   * for good, leaving exactly the frozen row this gate exists to clear. The
+   * repeat costs one hash comparison per build and collapses to a single
+   * write; the alternative costs correctness.
+   */
+  private async applyLiveEntityRetirement(data: LiveData[]): Promise<LiveData[]> {
+    const key = await this.liveEntityRetirementCacheKey();
+    const now = Date.now();
+    const tracked = this.readLiveEntityRetirementState(key);
+
+    const currentIds = new Set(data.map((entry) => entry.id));
+    for (const id of currentIds) tracked[id] = {seenAt: now, misses: 0};
+
+    // Ids closed on an earlier build. Their row is repeated so a close that
+    // was built but never delivered still lands, but they are settled
+    // business: they say nothing about whether the feed is healthy now, so
+    // they are kept out of both the guard's arithmetic and the log line.
+    const repeating: string[] = [];
+    const eligible: string[] = [];
+    let liveTracked = 0;
+    let absent = 0;
+
+    for (const [id, state] of Object.entries(tracked)) {
+      if (state.retiredAt !== undefined) {
+        if (now - state.retiredAt >= this.liveEntityRetirementRepeatMs) {
+          delete tracked[id];
+        } else if (!currentIds.has(id)) {
+          // Unreachable today: the loop above replaces state wholesale for
+          // anything in currentIds, so a retired id cannot also be present.
+          // Kept because it stops being unreachable the moment someone
+          // preserves fields across that assignment instead of overwriting —
+          // at which point a returning entity would emit a stale CLOSED
+          // alongside its live row.
+          repeating.push(id);
+        }
+        continue;
+      }
+      liveTracked += 1;
+      if (currentIds.has(id)) continue;
+      absent += 1;
+      state.misses += 1;
+      if (now - state.seenAt >= this.liveEntityRetirementMs && state.misses >= this.liveEntityRetirementMinMisses) {
+        eligible.push(id);
+      }
+    }
+
+    // Judge the feed's health on raw absence, not on the set about to be
+    // closed. Eligibility needs the age window to have elapsed, so a guard
+    // reading `eligible` cannot notice a collapse until the collapse has
+    // outlived that window — and a feed that recovers within a poll of that
+    // moment never gets looked at, leaving whatever is still missing to be
+    // closed on misses accrued entirely inside the outage. Absence is visible
+    // from the first build of a collapse instead.
+    const degraded = absent >= this.liveEntityRetirementMinBulk
+      && absent > liveTracked * this.liveEntityRetirementMaxFraction;
+
+    // Arm the cooldown only once the collapse has held, so a source that
+    // legitimately sheds most of its rows on some builds does not mute the
+    // gate on a single sample. Three builds still arms hours before the age
+    // window opens.
+    const guard = this.readLiveEntityRetirementGuard(key);
+    const streak = degraded ? guard.streak + 1 : 0;
+    let withheldAt = guard.withheldAt;
+    if (streak >= this.liveEntityRetirementMinMisses) withheldAt = now;
+
+    // A feed that just failed the trust test does not get to retire anything
+    // for a full window afterwards. Without this, whether a partial recovery
+    // publishes a wrong CLOSED comes down to which build it lands on: the
+    // miss counts reset on the withheld build, so a recovery arriving
+    // minMisses builds later finds a fresh, complete-looking set of misses
+    // accrued entirely inside the untrusted window.
+    const cooling = withheldAt != null && now - withheldAt < this.liveEntityRetirementMs;
+    CacheLib.set(`${key}:guard`, {withheldAt, streak}, 400 * 24 * 60 * 60);
+
+    if ((degraded || cooling) && eligible.length) {
+      for (const id of eligible) tracked[id].misses = 0;
+      console.warn(
+        `[${this.constructor.name}] withholding ${eligible.length} live-entity retirements ` +
+        `(${absent} of ${liveTracked} absent) — ` +
+        `${degraded ? 'feed looks degraded, not retired' : 'feed still cooling down after a degraded window'}`,
+      );
+    } else {
+      for (const id of eligible) {
+        data.push({id, status: 'CLOSED'} as LiveData);
+        tracked[id].retiredAt = now;
+      }
+      if (eligible.length) {
+        console.log(
+          `[${this.constructor.name}] force-closing ${eligible.length} live ` +
+          `${eligible.length === 1 ? 'entity' : 'entities'} absent from the feed: ${eligible.join(', ')}`,
+        );
+      }
+    }
+
+    for (const id of repeating) data.push({id, status: 'CLOSED'} as LiveData);
+
+    // Long TTL: this tracks "have we ever seen this id live", not a
+    // short-lived cache — losing it early just reverts that one id to the
+    // pre-fix silent-freeze behaviour until it's next seen live.
+    CacheLib.set(key, tracked, 400 * 24 * 60 * 60);
+    return data;
+  }
+
+  /**
+   * Read the retirement tracking map, tolerating the flat `id -> timestamp`
+   * shape written before consecutive-miss counting existed. Deployed caches
+   * hold that older shape and live for 400 days, so it has to keep working
+   * rather than force every tracked id back to square one.
+   */
+  private readLiveEntityRetirementState(key: string): Record<string, LiveEntityRetirementState> {
+    const raw = CacheLib.get(key) as Record<string, number | LiveEntityRetirementState> | null;
+    const out: Record<string, LiveEntityRetirementState> = {};
+    for (const [id, value] of Object.entries(raw ?? {})) {
+      if (typeof value === 'number') {
+        out[id] = {seenAt: value, misses: 0};
+      } else if (value && Number.isFinite(value.seenAt)) {
+        out[id] = {
+          seenAt: value.seenAt,
+          misses: Number.isFinite(value.misses) ? value.misses : 0,
+          ...(Number.isFinite(value.retiredAt as number) ? {retiredAt: value.retiredAt} : {}),
+        };
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Read the degraded-feed guard's own state: when it last withheld, and how
+   * many consecutive builds have looked degraded. Kept beside the tracking
+   * map rather than inside it so the map stays a plain id-to-state record.
+   */
+  private readLiveEntityRetirementGuard(key: string): {withheldAt: number | null, streak: number} {
+    // Caches written before this key existed simply have no row: the guard
+    // initialises cold, so a cooldown in flight across a deploy is forgotten
+    // once and re-arms within minMisses degraded builds. Fail-open by design.
+    const raw = CacheLib.get(`${key}:guard`) as {withheldAt?: unknown, streak?: unknown} | null;
+    return {
+      withheldAt: Number.isFinite(raw?.withheldAt as number) ? (raw!.withheldAt as number) : null,
+      streak: Number.isFinite(raw?.streak as number) ? (raw!.streak as number) : 0,
+    };
+  }
+
+  /**
+   * Stream live data updates in real time
+   *
+   * Returns an async generator that yields LiveData[] arrays as updates
+   * arrive from the upstream feed. Each yield contains only the item(s)
+   * that changed — a single-element array for per-document sources
+   * (e.g. Couchbase Lite), or a full snapshot for sources that send
+   * all data at once (e.g. WebSocket).
+   *
+   * For parks without a live feed (hasLiveStream = false), the generator
+   * returns immediately without yielding.
+   *
+   * The generator ends when the upstream connection closes. The caller
+   * is responsible for reconnecting by calling streamLiveData() again
+   * in a loop.
+   */
+  async *streamLiveData(): AsyncGenerator<LiveData[]> {
+    await this.init();
+    yield* this.buildLiveDataStream();
+  }
+
+  /**
+   * Build live data for all entities in this destination
+   *
+   * Subclasses should override this method to return live data (wait times,
+   * operating status, showtimes, etc.) for their entities.
+   *
+   * @param scope Optional set of published entity ids to limit the build to
+   *   (see getLiveData). Streaming destinations may honour it to build only the
+   *   changed entities; an override that ignores it returns the full snapshot.
+   * @returns {LiveData[]} List of live data for entities
+   */
+  protected async buildLiveData(scope?: ReadonlySet<string>): Promise<LiveData[]> {
+    void scope;
+    throw new Error("buildLiveData not implemented.");
+  }
+
+  /**
+   * Build a real-time stream of live data updates
+   *
+   * Override this method in parks that have a WebSocket or database sync
+   * feed. The default implementation is an empty generator (returns
+   * immediately, never yields).
+   *
+   * The connection to the live data source should be opened in _init(),
+   * not here. This method subscribes to the already-open connection
+   * and yields updates as they arrive.
+   *
+   * @returns Async generator yielding LiveData[] per update
+   */
+  protected async *buildLiveDataStream(): AsyncGenerator<LiveData[]> {
+    // Default: no live stream — return immediately
+  }
+
+  /**
+   * Get schedules for all entities in this destination
+   *
+   * ⚠️ **DO NOT OVERRIDE THIS METHOD** ⚠️
+   *
+   * This method automatically calls init() before fetching schedules.
+   * If you need to provide post-processing or validation of schedules,
+   * consider using the transform pattern in buildSchedules() instead.
+   *
+   * **To provide schedules, implement buildSchedules() instead.**
+   *
+   * @final This method is final and should not be overridden.
+   * @returns {EntitySchedule[]} List of schedules for entities
+   */
+  @trace()
+  async getSchedules(): Promise<EntitySchedule[]> {
+    await this.init();
+    const schedules = await this.buildSchedules();
+    for (const s of schedules) stripUndefinedDeep(s);
+    return schedules;
+  }
+
+  /**
+   * Build schedules for all entities in this destination
+   *
+   * Subclasses should override this method to return operating hours,
+   * show times, and other schedule information for their entities.
+   *
+   * @returns {EntitySchedule[]} List of schedules for entities
+   */
+  protected async buildSchedules(): Promise<EntitySchedule[]> {
+    throw new Error("buildSchedules not implemented.");
+  }
+};

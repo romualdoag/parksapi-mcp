@@ -1,0 +1,820 @@
+import {Destination, DestinationConstructor} from '../../destination.js';
+import {cache, CacheLib} from '../../cache.js';
+import {http, HTTPObj} from '../../http.js';
+import {inject} from '../../injector.js';
+import config from '../../config.js';
+import {destinationController} from '../../destinationRegistry.js';
+import {Entity, LiveData, EntitySchedule} from '@themeparks/typelib';
+import {decodeHtmlEntities, stripHtmlTags} from '../../htmlUtils.js';
+import {constructDateTime} from '../../datetime.js';
+import {TagBuilder} from '../../tags/index.js';
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/** Static park data for the two parks in Tokyo Disney Resort */
+/**
+ * Pull the published Premier Access prices out of the guide page.
+ *
+ * The page lists each experience followed by "N,NNN yen per access". Both
+ * parks are in the document at once — one is behind a tab, so it is present in
+ * the markup even when it is not on screen.
+ *
+ * Names are taken verbatim and matched exactly against the facility feed,
+ * which writes them identically. Exact rather than fuzzy on purpose: Tokyo
+ * Disneyland has both "Peter Pan's Flight" and "Peter Pan's Never Land
+ * Adventure", and only the second is sold with Premier Access.
+ */
+export function parsePremierAccessPrices(html: string): Record<string, number> {
+  const prices: Record<string, number> = {};
+  // Each experience is a heading followed by its rate in the same block:
+  //   <p class="heading3">Splash Mountain</p> … <strong>1,500 yen per access</strong>
+  //
+  // Split on the headings and look for a rate inside each one's own span,
+  // rather than flattening the page and scanning it. Stripping the tags leaves
+  // no separator between elements, so a flat scan reads the tail of whatever
+  // precedes a price as part of the name; and pairing a heading with the next
+  // rate anywhere after it lets an experience with no rate borrow the next
+  // one's.
+  const headings = [...html.matchAll(/class="heading3"[^>]*>([\s\S]*?)<\/p>/g)];
+  for (let i = 0; i < headings.length; i++) {
+    const h = headings[i];
+    const from = (h.index ?? 0) + h[0].length;
+    const to = i + 1 < headings.length ? (headings[i + 1].index ?? html.length) : html.length;
+    const rate = /([\d,]{3,7})\s*yen per access/.exec(html.slice(from, to));
+    if (!rate) continue;
+    const name = decodeHtmlEntities(stripHtmlTags(h[1])).replace(/\s+/g, ' ').trim();
+    const yen = Number(rate[1].replace(/,/g, ''));
+    if (!name || !Number.isFinite(yen) || yen <= 0) continue;
+    prices[name] = yen;
+  }
+  return prices;
+}
+
+const PARK_DATA: Record<string, {name: string; lat: number; lng: number}> = {
+  tdl: {name: 'Tokyo Disneyland', lat: 35.632896, lng: 139.880394},
+  tds: {name: 'Tokyo DisneySea', lat: 35.626411, lng: 139.885099},
+};
+
+// ============================================================================
+// Types
+// ============================================================================
+
+type TDRFacility = {
+  facilityCode: string;
+  facilityType: string;
+  name: string;
+  nameKana?: string;
+  parkType: string; // "TDL" or "TDS"
+  dummyFacility: boolean;
+  photoMapFlg: boolean;
+  fastpass: boolean;
+  filters: (string | {type: string})[];
+  restrictions: {type: string; name: string}[];
+  latitude?: number;
+  longitude?: number;
+};
+
+type TDRAttractionConditionOperating = {
+  startAt: string;
+  endAt: string;
+  /** PREPARATION | OPEN_NOTICE | CLOSE_NOTICE */
+  operatingStatus?: string;
+  operatingStatusMessage?: string;
+  isSunset?: boolean;
+  /** e.g. "SUSPEND" */
+  passAcceptanceType?: string;
+};
+
+type TDRAttractionCondition = {
+  facilityCode: string;
+  /** v7: CANCEL | CONFIRM_STATUS | CONFIRM_SCHEDULE — absent when operatings[] drives the state */
+  facilityStatus?: string;
+  facilityStatusMessage?: string;
+  standbyTime?: number;
+  /** NORMAL | FIXED | HIDE — HIDE means do not surface the wait time even when operating */
+  standbyTimeDisplayType?: string;
+  premierAccessStatus?: string;
+  priorityPassStatus?: string;
+  operatings?: TDRAttractionConditionOperating[];
+};
+
+type TDRCalendarEntry = {
+  parkType: string;
+  date: string;
+  closedDay: boolean;
+  undecided: boolean;
+  openTime: string;
+  closeTime: string;
+  spOpenTime?: string;
+  spCloseTime?: string;
+};
+
+type TDRConditionsResponse = {
+  attractions: TDRAttractionCondition[];
+  restaurants?: any[];
+};
+
+type TDRFacilitiesResponse = {
+  attractions: TDRFacility[];
+  entertainments: TDRFacility[];
+  restaurants: TDRFacility[];
+  [key: string]: TDRFacility[];
+};
+
+// ============================================================================
+// Pure helpers (exported for unit tests)
+// ============================================================================
+
+/**
+ * Map a v7 attraction condition to our standard status.
+ *
+ * Decoding order matters — a top-level `facilityStatus` overrides the per-window state:
+ *   CANCEL           → CLOSED (whole day cancelled)
+ *   CONFIRM_STATUS   → DOWN   (issue, status to be confirmed)
+ *   CONFIRM_SCHEDULE → CLOSED (schedule not yet announced)
+ * Otherwise pick the `operatings[]` window containing `now`:
+ *   OPEN_NOTICE  → OPERATING
+ *   CLOSE_NOTICE → DOWN
+ *   PREPARATION  → CLOSED (about to open, not yet operating)
+ * Outside every window or no operatings at all → CLOSED.
+ */
+export function mapAttractionStatus(
+  condition: TDRAttractionCondition,
+  now: Date,
+): string {
+  switch (condition.facilityStatus) {
+    case 'CANCEL':
+    case 'CONFIRM_SCHEDULE':
+      return 'CLOSED';
+    case 'CONFIRM_STATUS':
+      return 'DOWN';
+  }
+
+  const nowMs = now.getTime();
+  const currentWindow = (condition.operatings || []).find((op) => {
+    const startMs = Date.parse(op.startAt);
+    const endMs = Date.parse(op.endAt);
+    if (Number.isNaN(startMs) || Number.isNaN(endMs)) return false;
+    return nowMs >= startMs && nowMs <= endMs;
+  });
+
+  if (!currentWindow) return 'CLOSED';
+
+  switch (currentWindow.operatingStatus) {
+    case 'OPEN_NOTICE':
+      return 'OPERATING';
+    case 'CLOSE_NOTICE':
+      return 'DOWN';
+    case 'PREPARATION':
+    default:
+      return 'CLOSED';
+  }
+}
+
+// ============================================================================
+// Destination Implementation
+// ============================================================================
+
+@destinationController({category: 'Disney'})
+export class TokyoDisneyResort extends Destination {
+  @config
+  apiBase: string = '';
+
+  @config
+  apiKey: string = '';
+
+  @config
+  apiAuth: string = '';
+
+  @config
+  apiOS: string = '';
+
+  @config
+  apiVersion: string = '';
+
+  @config
+  fallbackDeviceId: string = '';
+
+  /**
+   * Base of the public guide site, e.g. https://www.tokyodisneyresort.jp.
+   *
+   * Unset by default, which makes the Premier Access price lookup a no-op and
+   * leaves the published price at `amount: null` — the same output as before
+   * this existed. Set it only in a build whose HTTP client the site accepts
+   * (see fetchPremierAccessPrices).
+   */
+  @config
+  webBase: string = '';
+
+  @config
+  timezone: string = 'Asia/Tokyo';
+
+  constructor(options?: DestinationConstructor) {
+    super(options);
+    this.addConfigPrefix('TDR');
+  }
+
+  // ===== Header Injection =====
+
+  /**
+   * Inject standard headers for all TDR API requests.
+   * Device ID and auth headers are added for all requests except device registration.
+   */
+  @inject({
+    eventName: 'httpRequest',
+    hostname: function () {
+      if (!this.apiBase) return '__noop__';
+      return new URL(this.apiBase).hostname;
+    },
+    tags: {$nin: ['deviceRegistration']},
+  })
+  async injectAPIHeaders(requestObj: HTTPObj): Promise<void> {
+    const appVersion = await this.getAppwatchVersion('jp.tokyodisneyresort.portalapp', this.apiVersion);
+    const deviceId = await this.getDeviceId();
+
+    requestObj.headers = {
+      ...requestObj.headers,
+      'user-agent': `TokyoDisneyResortApp/${appVersion} Android/${this.apiOS}`,
+      'x-api-key': this.apiKey,
+      'X-PORTAL-LANGUAGE': 'en-US',
+      'X-PORTAL-OS-VERSION': `Android ${this.apiOS}`,
+      'X-PORTAL-APP-VERSION': appVersion,
+      'X-PORTAL-DEVICE-NAME': 'OnePlus5',
+      'X-PORTAL-DEVICE-ID': deviceId,
+      'X-PORTAL-AUTH': this.apiAuth,
+      'connection': 'keep-alive',
+      'accept': 'application/json',
+      'content-type': 'application/json',
+    };
+  }
+
+  /**
+   * Inject headers for device registration requests (no device ID or auth).
+   */
+  @inject({
+    eventName: 'httpRequest',
+    hostname: function () {
+      if (!this.apiBase) return '__noop__';
+      return new URL(this.apiBase).hostname;
+    },
+    tags: {$in: ['deviceRegistration']},
+  })
+  async injectDeviceRegistrationHeaders(requestObj: HTTPObj): Promise<void> {
+    const appVersion = await this.getAppwatchVersion('jp.tokyodisneyresort.portalapp', this.apiVersion);
+
+    requestObj.headers = {
+      ...requestObj.headers,
+      'user-agent': `TokyoDisneyResortApp/${appVersion} Android/${this.apiOS}`,
+      'x-api-key': this.apiKey,
+      'X-PORTAL-LANGUAGE': 'en-US',
+      'X-PORTAL-OS-VERSION': `Android ${this.apiOS}`,
+      'X-PORTAL-APP-VERSION': appVersion,
+      'X-PORTAL-DEVICE-NAME': 'OnePlus5',
+      'connection': 'keep-alive',
+      'accept': 'application/json',
+      'content-type': 'application/json',
+    };
+  }
+
+  /**
+   * Handle HTTP error responses from TDR API.
+   * - 400: clear cached app version (API version enforcement)
+   * - 503 with systemMaintenance: log and handle gracefully
+   */
+  @inject({
+    eventName: 'httpResponse',
+    hostname: function () {
+      if (!this.apiBase) return '__noop__';
+      return new URL(this.apiBase).hostname;
+    },
+  })
+  async handleAPIResponse(requestObj: HTTPObj): Promise<void> {
+    if (requestObj.status === 400) {
+      console.log('[TDR] API returned 400, clearing cached app version...');
+      CacheLib.delete('TokyoDisneyResort:getAppwatchVersion:["jp.tokyodisneyresort.portalapp"]');
+    }
+
+    if (requestObj.status === 503) {
+      try {
+        const body = await requestObj.clone().json();
+        const maintenance = body?.errors?.find((x: any) => x.code === 'error.systemMaintenance');
+        if (maintenance) {
+          console.log(`[TDR] API in system maintenance: ${JSON.stringify(maintenance)}`);
+        }
+      } catch {
+        // could not parse response body
+      }
+    }
+  }
+
+  // ===== HTTP Fetch Methods =====
+
+  /**
+   * Register a device with the TDR API
+   */
+  @http({cacheSeconds: 60 * 60 * 24 * 14})
+  async fetchDeviceId(): Promise<HTTPObj> {
+    return {
+      method: 'POST',
+      url: `${this.apiBase}/rest/v1/devices`,
+      options: {json: true},
+      tags: ['deviceRegistration'],
+    } as HTTPObj;
+  }
+
+  /**
+   * Get a device ID (cached 2 weeks, falls back to fallbackDeviceId)
+   */
+  @cache({ttlSeconds: 60 * 60 * 24 * 14})
+  async getDeviceId(): Promise<string> {
+    try {
+      const resp = await this.fetchDeviceId();
+      const data = await resp.json();
+      if (data?.deviceId) {
+        return data.deviceId;
+      }
+    } catch (e) {
+      console.error(`[TDR] Failed to register device: ${e}`);
+    }
+
+    if (this.fallbackDeviceId) {
+      console.log(`[TDR] Using fallback device ID: ${this.fallbackDeviceId}`);
+      return this.fallbackDeviceId;
+    }
+
+    throw new Error('[TDR] Failed to register device and no fallback device ID configured');
+  }
+
+  /**
+   * Fetch all facilities data (attractions, entertainments, restaurants)
+   */
+  @http({cacheSeconds: 60 * 60 * 20})
+  async fetchFacilities(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/rest/v4/facilities`,
+      options: {json: true},
+    } as HTTPObj;
+  }
+
+  /**
+   * Get all facilities, flattened into an array with facilityType tag (cached 20h)
+   */
+  @cache({ttlSeconds: 60 * 60 * 20})
+  async getFacilities(): Promise<TDRFacility[]> {
+    const resp = await this.fetchFacilities();
+    const data: TDRFacilitiesResponse = await resp.json();
+
+    // Flatten into array with facilityType field
+    const facilities: TDRFacility[] = [];
+    for (const [facilityType, items] of Object.entries(data)) {
+      if (!Array.isArray(items)) continue;
+      for (const item of items) {
+        facilities.push({
+          ...item,
+          facilityType,
+        });
+      }
+    }
+
+    return facilities;
+  }
+
+  /**
+   * Fetch live conditions (wait times + statuses).
+   *
+   * Bumped v6 → v7 in app 3.11.7 (2026-06-12). v6 now returns 404. The v7 response shape:
+   *  - `facilityStatus` enum shrunk to CANCEL / CONFIRM_STATUS / CONFIRM_SCHEDULE — "OPEN" is gone
+   *  - operating-vs-down lives in `operatings[]` windows with `operatingStatus`: OPEN_NOTICE | CLOSE_NOTICE | PREPARATION
+   *  - `standbyTimeDisplayType` (NORMAL | FIXED | HIDE) gates whether `standbyTime` should be surfaced
+   */
+  @http({cacheSeconds: 60})
+  async fetchConditions(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/rest/v7/facilities/conditions`,
+      options: {json: true},
+    } as HTTPObj;
+  }
+
+  /**
+   * Get live conditions (cached 1min)
+   */
+  @cache({ttlSeconds: 60})
+  async getConditions(): Promise<TDRConditionsResponse> {
+    const resp = await this.fetchConditions();
+    const data = await resp.json();
+    return data || {attractions: []};
+  }
+
+  /**
+   * Fetch park calendar data
+   */
+  @http({cacheSeconds: 60 * 60 * 12})
+  async fetchCalendar(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/rest/v1/parks/calendars`,
+      options: {json: true},
+    } as HTTPObj;
+  }
+
+  /**
+   * Get calendar data (cached 12h)
+   */
+  /**
+   * URL of the Disney Premier Access guide page, which carries the published
+   * price for each experience.
+   *
+   * Public because a caller that has to fetch this with its own HTTP client
+   * (see fetchPremierAccessPrices) must build the same URL rather than keeping
+   * a second copy of the path that can drift from this one.
+   */
+  premierAccessPricesUrl(): string {
+    return `${this.webBase}/en/tdr/guide/app_service/disneypremieraccess.html`;
+  }
+
+  /**
+   * The Premier Access guide page.
+   *
+   * The site refuses parksapi's own HTTP client, so this does not complete
+   * unless the caller supplies a client it accepts (see
+   * premierAccessPricesUrl). With no webBase configured the price lookup is
+   * skipped entirely, so the default build never calls this.
+   */
+  @http({cacheSeconds: 60 * 60 * 12, retries: 1})
+  async fetchPremierAccessPrices(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: this.premierAccessPricesUrl(),
+      options: {json: false},
+      tags: ['website'],
+    } as HTTPObj;
+  }
+
+  /**
+   * Published Premier Access price per experience, keyed on the experience
+   * name exactly as the guide page writes it.
+   *
+   * The API never carries a price. Every endpoint that does sits behind a
+   * purchase flow requiring park tickets registered to a signed-in account, so
+   * an anonymous client cannot read one — but the rate itself is published, a
+   * flat per-experience figure on the public guide page. That is what this
+   * reads.
+   *
+   * Two things it is not. It is a rate card rather than a live quote, so it
+   * says what an experience costs, not what any particular guest was charged.
+   * And some entries carry an eligibility period ("From September 16 through
+   * October 31"); those are not parsed, because the live feed already tells us
+   * whether Premier Access is being sold for an experience today and that is
+   * the better signal.
+   *
+   * Amounts are whole yen. JPY has no minor unit, so the value is the price
+   * itself rather than a hundredth of it.
+   *
+   * Returns an empty map on any failure. A price is a bonus on top of the
+   * queue state, and never a reason to lose it.
+   *
+   * The webBase guard sits here, outside the cache, on purpose. Inside the
+   * cached method it would write an empty map under the same key a configured
+   * run reads, so a build that starts unconfigured and gets its webBase later
+   * keeps serving that empty map until the TTL runs out. That happened once,
+   * on 2026-09-02: the price shipped, the config landed an hour behind it, and
+   * every Premier Access queue published a null price for the rest of the day
+   * with nothing in the logs to say why.
+   */
+  async getPremierAccessPrices(): Promise<Record<string, number>> {
+    if (!this.webBase) return {};
+    return this.loadPremierAccessPrices();
+  }
+
+  /**
+   * Fetch and parse the guide page.
+   *
+   * Split from getPremierAccessPrices so only a configured lookup is ever
+   * cached, and given a TTL that depends on what came back: half a day for a
+   * real rate card, five minutes for an empty one. An empty result means the
+   * fetch failed or the page changed shape, and neither deserves to outlive a
+   * fix by twelve hours. The success path is what the long TTL is for — the
+   * rate card changes a few times a year.
+   */
+  @cache({callback: (prices: Record<string, number> | undefined) =>
+    prices && Object.keys(prices).length > 0 ? 60 * 60 * 12 : 60 * 5})
+  async loadPremierAccessPrices(): Promise<Record<string, number>> {
+    try {
+      const resp = await this.fetchPremierAccessPrices();
+      const html = await resp.text();
+      return parsePremierAccessPrices(html);
+    } catch (err) {
+      console.warn(`[${this.constructor.name}] Premier Access prices unavailable:`, err);
+      return {};
+    }
+  }
+
+  @cache({ttlSeconds: 60 * 60 * 12})
+  async getCalendar(): Promise<TDRCalendarEntry[]> {
+    const resp = await this.fetchCalendar();
+    const data = await resp.json();
+    return Array.isArray(data) ? data : [];
+  }
+
+  // ===== Helper Methods =====
+
+  /**
+   * Parse a height string like "107 cm" or "102cm" into centimeters.
+   */
+  private parseHeightCm(heightStr: string): number | undefined {
+    const match = /(\d+)\s*cm/.exec(heightStr);
+    if (!match) return undefined;
+    return Number(match[1]);
+  }
+
+  /**
+   * Check if a facility filter array contains a given filter type.
+   * Filters can be strings or objects with a type property.
+   */
+  private hasFilter(filters: (string | {type: string})[], filterType: string): boolean {
+    return filters.some((f) => {
+      if (typeof f === 'string') return f === filterType;
+      return f.type === filterType;
+    });
+  }
+
+  private mapStatus(condition: TDRAttractionCondition, now: Date = new Date()): string {
+    return mapAttractionStatus(condition, now);
+  }
+
+  // ===== Data Builder Methods =====
+
+  async getDestinations(): Promise<Entity[]> {
+    return [
+      {
+        id: 'tdr',
+        name: 'Tokyo Disney Resort',
+        entityType: 'DESTINATION',
+        timezone: this.timezone,
+        location: {latitude: 35.632896, longitude: 139.880394},
+      } as Entity,
+    ];
+  }
+
+  protected async buildEntityList(): Promise<Entity[]> {
+    const facilities = await this.getFacilities();
+    const destinationId = 'tdr';
+
+    // Build park entities from static data
+    const parkEntities: Entity[] = Object.entries(PARK_DATA).map(([parkId, data]) => ({
+      id: parkId,
+      name: data.name,
+      entityType: 'PARK',
+      parentId: destinationId,
+      destinationId,
+      timezone: this.timezone,
+      location: {latitude: data.lat, longitude: data.lng},
+    } as Entity));
+
+    // Filter and build attraction entities
+    const attractions = facilities.filter((f) => {
+      return (
+        f.facilityType === 'attractions' &&
+        !f.dummyFacility &&
+        (!f.photoMapFlg || this.hasFilter(f.filters || [], 'THRILL') || !!f.fastpass)
+      );
+    });
+
+    const attractionEntities = this.mapEntities(attractions, {
+      idField: 'facilityCode',
+      nameField: 'name',
+      entityType: 'ATTRACTION',
+      parentIdField: (item) => item.parkType.toLowerCase(),
+      destinationId,
+      timezone: this.timezone,
+      locationFields: {
+        lat: 'latitude',
+        lng: 'longitude',
+      },
+      transform: (entity, facility) => {
+        const tags: any[] = [];
+
+        // Paid return time (Premier Access / formerly FastPass)
+        if (facility.fastpass) {
+          tags.push(TagBuilder.paidReturnTime());
+        }
+
+        // Single rider
+        if (this.hasFilter(facility.filters || [], 'SINGLE_RIDER')) {
+          tags.push(TagBuilder.singleRider());
+        }
+
+        // Minimum height restriction
+        const lowerHeight = facility.restrictions?.find((r) => r.type === 'LOWER_HEIGHT');
+        if (lowerHeight) {
+          const heightCm = this.parseHeightCm(lowerHeight.name);
+          if (heightCm && heightCm > 0) {
+            tags.push(TagBuilder.minimumHeight(heightCm, 'cm'));
+          }
+        }
+
+        // Maximum height restriction
+        const upperHeight = facility.restrictions?.find((r) => r.type === 'UPPER_HEIGHT');
+        if (upperHeight) {
+          const heightCm = this.parseHeightCm(upperHeight.name);
+          if (heightCm && heightCm > 0) {
+            tags.push(TagBuilder.maximumHeight(heightCm, 'cm'));
+          }
+        }
+
+        // Unsuitable for pregnant people
+        if (this.hasFilter(facility.filters || [], 'EXPECTANT_MOTHER')) {
+          tags.push(TagBuilder.unsuitableForPregnantPeople());
+        }
+
+        entity.tags = tags.filter(Boolean);
+        return entity;
+      },
+    });
+
+    // Filter and build show entities
+    const shows = facilities.filter((f) => {
+      return f.facilityType === 'entertainments' && !f.dummyFacility && !f.photoMapFlg;
+    });
+
+    const showEntities = this.mapEntities(shows, {
+      idField: 'facilityCode',
+      nameField: 'name',
+      entityType: 'SHOW',
+      parentIdField: (item) => item.parkType.toLowerCase(),
+      destinationId,
+      timezone: this.timezone,
+      locationFields: {
+        lat: 'latitude',
+        lng: 'longitude',
+      },
+    });
+
+    // Restaurants: return empty array (not surfaced)
+
+    return [
+      ...await this.getDestinations(),
+      ...parkEntities,
+      ...attractionEntities,
+      ...showEntities,
+    ];
+  }
+
+  protected async buildLiveData(): Promise<LiveData[]> {
+    const conditions = await this.getConditions();
+    // Prices are a bonus on top of the queue state. Both of these degrade to
+    // empty rather than throwing, so a guide-page change cannot cost us the
+    // live data.
+    const prices = await this.getPremierAccessPrices().catch(() => ({} as Record<string, number>));
+    const nameByCode = new Map<string, string>(
+      (await this.getFacilities().catch(() => []))
+        .map((f) => [String(f.facilityCode), f.name] as const),
+    );
+    const liveData: LiveData[] = [];
+
+    if (!conditions?.attractions) {
+      return liveData;
+    }
+
+    // Hoist once so all attractions agree on "now" across this build.
+    const now = new Date();
+
+    for (const attr of conditions.attractions) {
+      if (!attr.facilityCode) continue;
+
+      const status = this.mapStatus(attr, now);
+      const ld: LiveData = {
+        id: String(attr.facilityCode),
+        status,
+      } as LiveData;
+
+      // Suppress wait time when the upstream UI is set to HIDE (e.g. continuous-flow
+      // attractions, walkthroughs, paid-only experiences) even if status is OPERATING.
+      const showStandby = attr.standbyTimeDisplayType !== 'HIDE';
+
+      // Standby queue
+      ld.queue = {
+        STANDBY: {
+          waitTime:
+            status === 'OPERATING' && showStandby
+              ? (attr.standbyTime ?? undefined)
+              : undefined,
+        },
+      };
+
+      // Premier Access (paid return time).
+      //
+      // The return WINDOW is genuinely unavailable. /rest/v7/facilities/
+      // conditions carries premierAccessStatus and nothing else; the endpoints
+      // that hold a window all require park tickets registered to a signed-in
+      // account, so an anonymous client cannot read one. Those nulls are a
+      // hard limit, not a TODO.
+      //
+      // The PRICE is not. It is published as a flat per-experience rate on the
+      // public guide page, and getPremierAccessPrices() reads it when a
+      // webBase is configured. Absent that it stays null, which means "paid,
+      // rate unknown" — never 0, which would say the queue is free.
+      //
+      // An earlier version of this comment claimed the price was a
+      // per-purchase quote and therefore unobtainable. That was wrong: the API
+      // not carrying a value is not the same as the value being unpublished.
+      if (attr.premierAccessStatus) {
+        const facilityName = nameByCode.get(String(attr.facilityCode));
+        const yen = facilityName ? prices[facilityName] : undefined;
+        ld.queue!.PAID_RETURN_TIME = this.buildPaidReturnTimeQueue(
+          attr.premierAccessStatus === 'SELLING' ? 'AVAILABLE' : 'FINISHED',
+          null,
+          null,
+          'JPY',
+          yen ?? null,
+        );
+      }
+
+      // Priority Pass (free return time)
+      if (attr.priorityPassStatus) {
+        ld.queue!.RETURN_TIME = this.buildReturnTimeQueue(
+          attr.priorityPassStatus === 'TICKETING' ? 'AVAILABLE' : 'FINISHED',
+          null,
+          null,
+        );
+      }
+
+      liveData.push(ld);
+    }
+
+    return liveData;
+  }
+
+  /**
+   * Park hours from `/rest/v1/parks/calendars`.
+   *
+   * The output looks wrong and is not: every announced day opens at 09:00,
+   * New Year's Eve included. That is what the resort publishes. Checked
+   * against tokyodisneyresort.jp over 2026-08 → 2027-02 — the site shows
+   * 09:00-21:00 on 303 park-days, 09:00-18:30 on 5 and 09:00-19:00 on 2, and
+   * the exception dates are the same set this endpoint returns. The app has
+   * no other source: `/rest/v3/parks/conditions` carries `earlyEntryFlg` and
+   * `allNightDay` as bare booleans with no times, and `/rest/v2|v3/parks/
+   * calendars` are 404.
+   *
+   * `spOpenTime`/`spCloseTime` are empty on every current row because no
+   * special-hours event is scheduled, so the EXTRA_HOURS branch below is
+   * dormant rather than dead.
+   *
+   * Closed and undecided days are dropped. `CLOSED` is not a typelib
+   * ScheduleType — absence is how a closure is expressed.
+   */
+  protected async buildSchedules(): Promise<EntitySchedule[]> {
+    const calendar = await this.getCalendar();
+
+    // Initialize schedule map for both parks
+    const scheduleMap = new Map<string, any[]>();
+    scheduleMap.set('tdl', []);
+    scheduleMap.set('tds', []);
+
+    for (const entry of calendar) {
+      // Skip closed or undecided days
+      if (entry.closedDay || entry.undecided) continue;
+
+      const parkId = entry.parkType.toLowerCase();
+      if (!scheduleMap.has(parkId)) continue;
+
+      const dateStr = entry.date; // Already in YYYY-MM-DD format
+
+      // Operating hours
+      if (entry.openTime && entry.closeTime) {
+        scheduleMap.get(parkId)!.push({
+          date: dateStr,
+          openingTime: constructDateTime(dateStr, entry.openTime, this.timezone),
+          closingTime: constructDateTime(dateStr, entry.closeTime, this.timezone),
+          type: 'OPERATING',
+        });
+      }
+
+      // Special hours (Extra Hours)
+      if (entry.spOpenTime && entry.spCloseTime) {
+        scheduleMap.get(parkId)!.push({
+          date: dateStr,
+          openingTime: constructDateTime(dateStr, entry.spOpenTime, this.timezone),
+          closingTime: constructDateTime(dateStr, entry.spCloseTime, this.timezone),
+          type: 'EXTRA_HOURS',
+          description: 'Special Hours',
+        });
+      }
+    }
+
+    // Convert to EntitySchedule array
+    const schedules: EntitySchedule[] = [];
+    for (const [parkId, schedule] of scheduleMap) {
+      if (schedule.length > 0) {
+        schedules.push({id: parkId, schedule} as EntitySchedule);
+      }
+    }
+
+    return schedules;
+  }
+}

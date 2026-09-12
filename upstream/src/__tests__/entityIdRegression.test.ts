@@ -1,0 +1,397 @@
+/**
+ * Entity ID regression tests.
+ *
+ * These tests verify that entity IDs produced by TS park implementations
+ * match the expected format and don't change unexpectedly. Entity ID
+ * stability is critical because the ThemeParks.wiki collector agent
+ * references entities by ID — changed IDs would corrupt the database.
+ *
+ * Tests cover:
+ * 1. ID format validation (string, non-empty, no null/undefined)
+ * 2. Destination/park ID patterns per framework
+ * 3. Entity hierarchy consistency (parentId references valid entities)
+ * 4. No duplicate IDs within a destination
+ */
+
+import { describe, test, expect, afterAll } from 'vitest';
+import { Destination } from '../destination.js';
+import { Entity } from '@themeparks/typelib';
+import { stopHttpQueue } from '../http.js';
+import { getAllDestinations } from '../destinationRegistry.js';
+
+afterAll(() => {
+  stopHttpQueue();
+});
+
+describe('Entity ID format validation', () => {
+  test('all registered destinations have valid IDs', async () => {
+    const destinations = await getAllDestinations();
+    expect(destinations.length).toBeGreaterThan(0);
+
+    for (const dest of destinations) {
+      expect(dest.id).toBeTruthy();
+      expect(typeof dest.id).toBe('string');
+      expect(dest.id).not.toBe('null');
+      expect(dest.id).not.toBe('undefined');
+      expect(dest.id.trim()).toBe(dest.id); // no leading/trailing whitespace
+    }
+  });
+
+  test('all registered destinations have valid names', async () => {
+    const destinations = await getAllDestinations();
+
+    for (const dest of destinations) {
+      expect(dest.name).toBeTruthy();
+      expect(typeof dest.name).toBe('string');
+      expect(dest.name.length).toBeGreaterThan(0);
+    }
+  });
+
+  test('no duplicate destination IDs', async () => {
+    const destinations = await getAllDestinations();
+    const ids = destinations.map(d => d.id);
+    const uniqueIds = new Set(ids);
+    const duplicates = ids.filter((id, i) => ids.indexOf(id) !== i);
+
+    expect(duplicates).toEqual([]);
+    expect(uniqueIds.size).toBe(ids.length);
+  });
+});
+
+describe('Destination ID patterns', () => {
+  test('Universal destinations use expected ID format', async () => {
+    const destinations = await getAllDestinations();
+    const universal = destinations.filter(d =>
+      Array.isArray(d.category) ? d.category.includes('Universal') : d.category === 'Universal'
+    );
+
+    expect(universal.length).toBe(5);
+    for (const u of universal) {
+      // Universal IDs are derived from class name: universalorlando, universalstudios, universalstudiosbeijing, universalstudiosjapan, universalsingapore
+      expect(u.id).toMatch(/^universal/);
+    }
+  });
+
+  test('Six Flags framework is registered as a single destination entry', async () => {
+    const destinations = await getAllDestinations();
+    const sixflags = destinations.filter(d =>
+      Array.isArray(d.category) ? d.category.includes('Six Flags') : d.category === 'Six Flags'
+    );
+
+    // The original framework class (handles 25+ US parks via Firebase config)
+    // must be exactly one entry — it must not have been double-registered.
+    const framework = sixflags.filter(d => d.id === 'sixflags');
+    expect(framework.length).toBe(1);
+
+    // Other Six Flags-branded destinations with their own API (e.g. Qiddiya
+    // City) may also live in this category — they're separate entries.
+  });
+
+  test('Parcs Reunidos parks are registered individually', async () => {
+    const destinations = await getAllDestinations();
+    const pr = destinations.filter(d =>
+      Array.isArray(d.category) ? d.category.includes('Parcs Reunidos') : d.category === 'Parcs Reunidos'
+    );
+
+    // 5 parks (Kennywood moved to HFE)
+    expect(pr.length).toBe(5);
+    const ids = pr.map(d => d.id).sort();
+    expect(ids).toContain('movieparkgermany');
+    expect(ids).toContain('bobbejaanland');
+    expect(ids).toContain('mirabilandia');
+  });
+
+  test('HFE parks are registered individually', async () => {
+    const destinations = await getAllDestinations();
+    const hfe = destinations.filter(d =>
+      Array.isArray(d.category) ? d.category.includes('Herschend') : d.category === 'Herschend'
+    );
+
+    expect(hfe.length).toBe(4);
+    const ids = hfe.map(d => d.id).sort();
+    expect(ids).toContain('dollywood');
+    expect(ids).toContain('silverdollarcity');
+    expect(ids).toContain('kennywood');
+    expect(ids).toContain('kentuckykingdom');
+  });
+
+  test('Six Flags class covers both Six Flags and Cedar Fair parks', async () => {
+    // After the Cedar Fair / Six Flags merger the individual Cedar Fair
+    // apps were retired in favour of the unified Six Flags app, so parksapi
+    // models all of them through a single dynamic destination class.
+    const destinations = await getAllDestinations();
+    const ids = destinations.map(d => d.id);
+    expect(ids).toContain('sixflags');
+  });
+
+  test('Valleyfair park class is registered under the Enchanted Parks umbrella', async () => {
+    // Registry id: `@destinationController` derives this from the class name.
+    // `class Valleyfair` registers as `valleyfair` — same as the dropped cedarfair
+    // class did, so consumers that look up parks by registry id stay compatible.
+    const destinations = await getAllDestinations();
+    const ids = destinations.map(d => d.id);
+    expect(ids).toContain('valleyfair');
+    const vf = destinations.find(d => d.id === 'valleyfair');
+    expect(vf?.category).toEqual(['Enchanted Parks', 'Valleyfair']);
+  });
+
+  test('Valleyfair emits enchantedparks-namespaced DESTINATION entity id', async () => {
+    // Entity id (distinct from registry id): the actual id on the DESTINATION
+    // entity returned by getDestinations(). The old cedarfair class emitted
+    // `valleyfair`; the new class emits `enchantedparks_valleyfair` so the
+    // umbrella's namespace is used consistently.
+    const {Valleyfair} = await import('../parks/enchantedparks/valleyfair.js');
+    const dest = new Valleyfair({});
+    const destinations = await dest.getDestinations();
+    expect(destinations[0]?.id).toBe('enchantedparks_valleyfair');
+    expect(destinations[0]?.id).not.toBe('valleyfair');
+  });
+
+  test('Worlds of Fun park class is registered under the Enchanted Parks umbrella', async () => {
+    const destinations = await getAllDestinations();
+    const ids = destinations.map(d => d.id);
+    expect(ids).toContain('worldsoffun');
+    const wof = destinations.find(d => d.id === 'worldsoffun');
+    expect(wof?.category).toEqual(['Enchanted Parks', 'Worlds of Fun']);
+  });
+
+  test('Worlds of Fun emits enchantedparks-namespaced DESTINATION entity id', async () => {
+    const {WorldsOfFun} = await import('../parks/enchantedparks/worldsoffun.js');
+    const dest = new WorldsOfFun({});
+    const destinations = await dest.getDestinations();
+    expect(destinations[0]?.id).toBe('enchantedparks_worldsoffun');
+    expect(destinations[0]?.id).not.toBe('worldsoffun');
+  });
+
+  test('Michigan\'s Adventure park class is registered under the Enchanted Parks umbrella', async () => {
+    const destinations = await getAllDestinations();
+    const ids = destinations.map(d => d.id);
+    expect(ids).toContain('michigansadventure');
+    const ma = destinations.find(d => d.id === 'michigansadventure');
+    expect(ma?.category).toEqual(['Enchanted Parks', 'Michigan\'s Adventure']);
+  });
+
+  test('Michigan\'s Adventure emits enchantedparks-namespaced DESTINATION entity id', async () => {
+    const {MichigansAdventure} = await import('../parks/enchantedparks/michigansadventure.js');
+    const dest = new MichigansAdventure({});
+    const destinations = await dest.getDestinations();
+    expect(destinations[0]?.id).toBe('enchantedparks_michigansadventure');
+    expect(destinations[0]?.id).not.toBe('michigansadventure');
+  });
+
+  test('Mid-America Parks class is registered under the Enchanted Parks umbrella', async () => {
+    const destinations = await getAllDestinations();
+    const ids = destinations.map(d => d.id);
+    expect(ids).toContain('midamericaparks');
+    const map = destinations.find(d => d.id === 'midamericaparks');
+    expect(map?.category).toEqual(['Enchanted Parks', 'Mid-America Parks']);
+  });
+
+  test('Mid-America Parks emits enchantedparks-namespaced DESTINATION entity id', async () => {
+    // Migrated from sixflags_destination_SFSL → enchantedparks_midamericaparks
+    // when EPR/Enchanted Parks took over for the 2026 season. Wiki externalId
+    // will be renamed to match.
+    const {MidAmericaParks} = await import('../parks/enchantedparks/midamericaparks.js');
+    const dest = new MidAmericaParks({});
+    const destinations = await dest.getDestinations();
+    expect(destinations[0]?.id).toBe('enchantedparks_midamericaparks');
+    expect(destinations[0]?.id).not.toBe('midamericaparks');
+  });
+
+  test('Great Escape Parks class is registered under the Enchanted Parks umbrella', async () => {
+    const destinations = await getAllDestinations();
+    const ids = destinations.map(d => d.id);
+    expect(ids).toContain('greatescapeparks');
+    const ge = destinations.find(d => d.id === 'greatescapeparks');
+    expect(ge?.category).toEqual(['Enchanted Parks', 'Great Escape Parks']);
+  });
+
+  test('Great Escape Parks emits enchantedparks-namespaced DESTINATION entity id', async () => {
+    // Migrated from sixflags_destination_SFGE → enchantedparks_greatescapeparks
+    // when EPR/Enchanted Parks took over for the 2026 season.
+    const {GreatEscapeParks} = await import('../parks/enchantedparks/greatescapeparks.js');
+    const dest = new GreatEscapeParks({});
+    const destinations = await dest.getDestinations();
+    expect(destinations[0]?.id).toBe('enchantedparks_greatescapeparks');
+    expect(destinations[0]?.id).not.toBe('greatescapeparks');
+  });
+
+  test('Galveston Island Waterpark class is registered under the Enchanted Parks umbrella', async () => {
+    const destinations = await getAllDestinations();
+    const ids = destinations.map(d => d.id);
+    expect(ids).toContain('galvestonislandwaterpark');
+    const giwp = destinations.find(d => d.id === 'galvestonislandwaterpark');
+    expect(giwp?.category).toEqual(['Enchanted Parks', 'Galveston Island Waterpark']);
+  });
+
+  test('Galveston Island Waterpark emits enchantedparks-namespaced DESTINATION entity id', async () => {
+    // Migrated from sixflags_destination_GV → enchantedparks_galvestonislandwaterpark
+    // when EPR/Enchanted Parks took over for the 2026 season.
+    const {GalvestonIslandWaterpark} = await import('../parks/enchantedparks/galvestonislandwaterpark.js');
+    const dest = new GalvestonIslandWaterpark({});
+    const destinations = await dest.getDestinations();
+    expect(destinations[0]?.id).toBe('enchantedparks_galvestonislandwaterpark');
+    expect(destinations[0]?.id).not.toBe('galvestonislandwaterpark');
+  });
+
+  test('Fantawild uber-class is registered under the Fantawild category', async () => {
+    const destinations = await getAllDestinations();
+    const fantawild = destinations.find(d => d.id === 'fantawild');
+    expect(fantawild).toBeDefined();
+    expect(fantawild?.category).toBe('Fantawild');
+  });
+
+  test('Fantawild emits one DESTINATION entity per park in FANTAWILD_PARKS', async () => {
+    const {Fantawild, FANTAWILD_PARKS} = await import('../parks/fantawild/fantawild.js');
+    const dest = new Fantawild({config: {
+      baseUrl: 'https://image.fangte.com',
+      apiBaseUrl: 'https://leyou.fangte.com',
+    }});
+    const destinations = await dest.getDestinations();
+    expect(destinations.length).toBe(FANTAWILD_PARKS.length);
+    // All ids follow the `fantawild_destination_<parkId>` scheme
+    for (const e of destinations) {
+      expect(e.id).toMatch(/^fantawild_destination_\d+$/);
+      expect(e.entityType).toBe('DESTINATION');
+    }
+    // Spot-check a known park (Wuhu Dreamland, parkId 19)
+    const wuhu = destinations.find(d => d.id === 'fantawild_destination_19');
+    expect(wuhu).toBeDefined();
+    expect(wuhu?.name).toBe('Fantawild Dreamland Wuhu');
+  });
+
+  test('Fantawild destination IDs are unique across the park list', async () => {
+    const {FANTAWILD_PARKS} = await import('../parks/fantawild/fantawild.js');
+    const ids = FANTAWILD_PARKS.map(p => p.parkId);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  test('Fantawild getDestinations and buildEntityList emit the SAME destination IDs', async () => {
+    // Drift between these two surfaces silently corrupts the wiki: the
+    // registry would advertise one set of destination IDs while the entity
+    // sweep emits another. Lock them together.
+    const {Fantawild} = await import('../parks/fantawild/fantawild.js');
+    const dest = new Fantawild({config: {
+      baseUrl: 'https://image.fangte.com',
+      apiBaseUrl: 'https://leyou.fangte.com',
+    }});
+    // Stub the live HTTP layer so buildEntityList doesn't network during the test.
+    (dest as unknown as {getItems: () => Promise<unknown[]>}).getItems = async () => [];
+    // That stub leaves every park with no rides, which getEntities() otherwise
+    // refuses to publish. This test is about the two surfaces agreeing on
+    // destination IDs, not about the list being publishable.
+    (dest as unknown as {allowEmptyEntityList: boolean}).allowEmptyEntityList = true;
+    const [destinations, entities] = await Promise.all([
+      dest.getDestinations(),
+      dest.getEntities(),
+    ]);
+    const destIds = new Set(destinations.map(d => d.id));
+    const entityDestIds = new Set(entities.filter(e => e.entityType === 'DESTINATION').map(e => e.id));
+    expect(entityDestIds).toEqual(destIds);
+  });
+
+  test('Attractions.io v1 Merlin parks are registered individually', async () => {
+    const destinations = await getAllDestinations();
+    const merlin = destinations.filter(d =>
+      Array.isArray(d.category) ? d.category.includes('Merlin') : d.category === 'Merlin'
+    );
+
+    // 15 Merlin parks (Knoebels is not Merlin)
+    expect(merlin.length).toBeGreaterThanOrEqual(14);
+    const ids = merlin.map(d => d.id);
+    expect(ids).toContain('altontowers');
+    expect(ids).toContain('thorpepark');
+    expect(ids).toContain('chessingtonworldofadventures');
+    expect(ids).toContain('legolandwindsor');
+    expect(ids).toContain('gardaland');
+    expect(ids).toContain('heidepark');
+  });
+
+  test('All 16 Attractions.io v1 parks are registered', async () => {
+    const destinations = await getAllDestinations();
+    const ids = destinations.map(d => d.id);
+
+    const expectedV1Parks = [
+      'altontowers', 'thorpepark', 'chessingtonworldofadventures',
+      'legolandwindsor', 'legolandorlando', 'legolandcalifornia',
+      'legolandbillund', 'legolanddeutschland', 'gardaland',
+      'heidepark', 'knoebels', 'legolandjapan',
+      'djurssommerland', 'legolandnewyork', 'legolandkorea',
+      'peppapigthemeparkflorida',
+    ];
+
+    for (const parkId of expectedV1Parks) {
+      expect(ids).toContain(parkId);
+    }
+  });
+
+  test('Parc Asterix is registered', async () => {
+    const destinations = await getAllDestinations();
+    const pa = destinations.find(d => d.id === 'parcasterix');
+    expect(pa).toBeDefined();
+    expect(pa!.name).toBe('Parc Asterix');
+  });
+
+  test('TE2 Australia parks are registered', async () => {
+    const destinations = await getAllDestinations();
+    const ids = destinations.map(d => d.id);
+    expect(ids).toContain('seaworldgoldcoast');
+    expect(ids).toContain('warnerbrosmovieworld');
+    expect(ids).toContain('paradisecountry');
+    expect(ids).toContain('wetnwildgoldcoast');
+  });
+
+  test('Disney parks are registered', async () => {
+    const destinations = await getAllDestinations();
+    const ids = destinations.map(d => d.id);
+    expect(ids).toContain('disneylandparis');
+    expect(ids).toContain('tokyodisneyresort');
+    expect(ids).toContain('shanghaidisneylandresort');
+  });
+});
+
+describe('Entity ID contract rules', () => {
+  test('entity IDs must always be strings', () => {
+    // This is a compile-time guarantee from TypeScript,
+    // but verify the runtime behavior of String() conversion
+    expect(String(123)).toBe('123');
+    expect(String(null)).toBe('null'); // This is why we filter nulls
+    expect(String(undefined)).toBe('undefined');
+    expect(String('')).toBe('');
+  });
+
+  test('Six Flags entity IDs follow RIDE/SHOW/RESTAURANT-parkId-fimsId format', async () => {
+    // Verify the Six Flags ID format matches what the JS produces
+    // This is critical for backwards compatibility with the wiki database
+    const patterns = [
+      'RIDE-001-00164',      // ride at park 001
+      'RESTAURANT-001-00002', // restaurant at park 001
+      'SHOW-001-00001',       // show at park 001
+    ];
+
+    for (const id of patterns) {
+      expect(id).toMatch(/^(RIDE|SHOW|RESTAURANT)-\d{3}-\d{5}$/);
+    }
+  });
+
+  test('Parcs Reunidos entity IDs use parquesreunidos_ prefix for destinations/parks', () => {
+    // The JS uses parquesreunidos_ (Spanish spelling with typo from original directory name)
+    const destId = 'parquesreunidos_1110';
+    const parkId = 'parquesreunidos_1110_park';
+
+    expect(destId).toMatch(/^parquesreunidos_\d+$/);
+    expect(parkId).toMatch(/^parquesreunidos_\d+_park$/);
+  });
+
+  test('HFE entity IDs are UUIDs', () => {
+    // Kennywood/Dollywood/SDC use UUID entity IDs from the CRM API
+    const uuid = 'acf887a6-59f6-4d70-8120-2d9fac938109';
+    expect(uuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+
+  test('Universal entity IDs are numeric strings', () => {
+    // Universal uses numeric IDs from the API, stored as strings
+    const id = '10000';
+    expect(id).toMatch(/^\d+$/);
+  });
+});

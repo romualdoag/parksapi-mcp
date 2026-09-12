@@ -1,0 +1,110 @@
+/**
+ * Test HTML utility functions
+ */
+import { describe, test, expect } from 'vitest';
+import { decodeHtmlEntities, stripHtmlTags } from '../htmlUtils.js';
+
+describe('decodeHtmlEntities', () => {
+  test('decodes named entities', () => {
+    expect(decodeHtmlEntities('Tom &amp; Jerry')).toBe('Tom & Jerry');
+    expect(decodeHtmlEntities('&lt;script&gt;')).toBe('<script>');
+    expect(decodeHtmlEntities('&quot;hello&quot;')).toBe('"hello"');
+    expect(decodeHtmlEntities('it&apos;s')).toBe("it's");
+  });
+
+  test('decodes numeric decimal entities', () => {
+    expect(decodeHtmlEntities('&#34;hello&#34;')).toBe('"hello"');
+    expect(decodeHtmlEntities('&#39;test&#39;')).toBe("'test'");
+    expect(decodeHtmlEntities('100&#176; Fun')).toBe('100° Fun');
+  });
+
+  test('decodes hex entities', () => {
+    expect(decodeHtmlEntities("Rock &#x27;n&#x27; Roll")).toBe("Rock 'n' Roll");
+    expect(decodeHtmlEntities('&#x26;')).toBe('&');
+  });
+
+  test('handles mixed entities', () => {
+    expect(decodeHtmlEntities('&amp; &#34; &#x27;')).toBe('& " \'');
+  });
+
+  test('returns empty string for empty input', () => {
+    expect(decodeHtmlEntities('')).toBe('');
+  });
+
+  test('returns original string if no entities', () => {
+    expect(decodeHtmlEntities('hello world')).toBe('hello world');
+  });
+
+  test('handles &nbsp;', () => {
+    expect(decodeHtmlEntities('hello&nbsp;world')).toBe('hello world');
+  });
+
+  test('handles &#125; (closing brace)', () => {
+    expect(decodeHtmlEntities('&#125;')).toBe('}');
+  });
+
+  test('does not double-decode nested entity encoding', () => {
+    // &#38; is the numeric encoding of '&'. Naive sequential decoding would
+    // expand &#38;amp; to &amp; then to &. The correct one-pass result keeps
+    // &amp; literal because each entity is only decoded once.
+    expect(decodeHtmlEntities('&#38;amp;')).toBe('&amp;');
+    expect(decodeHtmlEntities('&#x26;amp;')).toBe('&amp;');
+  });
+});
+
+describe('stripHtmlTags', () => {
+  test('strips <p> tags', () => {
+    expect(stripHtmlTags('<p>Blue Streak</p>')).toBe('Blue Streak');
+  });
+
+  test('strips multiple tags', () => {
+    expect(stripHtmlTags('<p>Hello <b>World</b></p>')).toBe('Hello World');
+  });
+
+  test('handles empty string', () => {
+    expect(stripHtmlTags('')).toBe('');
+  });
+
+  test('trims whitespace', () => {
+    expect(stripHtmlTags('  <p> Hello </p>  ')).toBe('Hello');
+  });
+
+  test('handles self-closing tags', () => {
+    expect(stripHtmlTags('Hello<br/>World')).toBe('HelloWorld');
+  });
+
+  test('nested-bracket adversarial input is fully sanitized', () => {
+    // The depth-counting walker treats every '<' as opening a tag region,
+    // so `<scrip<script>t>alert(1)</script>` reduces to just `alert(1)`.
+    expect(stripHtmlTags('<scrip<script>t>alert(1)</script>')).toBe('alert(1)');
+    expect(stripHtmlTags('<<script>script>alert(1)<</script>/script>')).toBe('alert(1)');
+    expect(stripHtmlTags('<<>>')).toBe('');
+  });
+
+  test('a stray `>` outside a tag region survives (matches old regex behaviour)', () => {
+    expect(stripHtmlTags('>oops')).toBe('>oops');
+    expect(stripHtmlTags('<p>hi</p> > there')).toBe('hi > there');
+  });
+
+  test('an unmatched `<` is preserved with everything after it (no truncation)', () => {
+    // The old regex required a closing `>` to match, so `2 < 3` and
+    // `<unclosed` were left intact. The walker must do the same — if it
+    // reaches EOF mid-tag, the outermost `<` was never a tag, so we
+    // emit the buffered region verbatim.
+    expect(stripHtmlTags('2 < 3')).toBe('2 < 3');
+    expect(stripHtmlTags('<unclosed')).toBe('<unclosed');
+    expect(stripHtmlTags('<p>start</p> 2 < 3')).toBe('start 2 < 3');
+  });
+
+  test('idempotent — running the strip again never changes the result', () => {
+    const samples = [
+      '<<>>',
+      '<scr<p></p>ipt>x<scr<p></p>ipt>',
+      'plain text with no tags',
+      '<p>well-formed</p>',
+    ];
+    for (const input of samples) {
+      expect(stripHtmlTags(stripHtmlTags(input))).toBe(stripHtmlTags(input));
+    }
+  });
+});

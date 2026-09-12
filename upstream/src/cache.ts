@@ -1,0 +1,599 @@
+import {DatabaseSync} from 'node:sqlite';
+import {persistentKeyExclusion} from './cacheKeys.js';
+
+const CACHE_DB_PATH = process.env.CACHE_DB_PATH || './cache.sqlite';
+const MAX_CACHE_ENTRIES = parseInt(process.env.CACHE_MAX_ENTRIES || '50000', 10);
+const CLEANUP_INTERVAL_MS = parseInt(process.env.CACHE_CLEANUP_INTERVAL_MS || '300000', 10); // 5 minutes
+// SQLite contention is handled by PRAGMA busy_timeout=5000 (waits up to 5s for
+// the lock). No application-level retry needed.
+
+// Track if we're in temporary mode
+let isTemporaryMode = false;
+
+// Initialize database (can be re-initialized). Assigned below, once
+// openDatabase() is defined — every cache database is built through it.
+let database: DatabaseSync;
+
+export {database};
+
+/**
+ * Initialize database schema
+ */
+function initializeDatabase(db: DatabaseSync, skipMigration: boolean = false): void {
+  // Build cache table if it doesn't exist
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cache(
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      timestamp INTEGER,
+      lastAccess INTEGER
+    ) STRICT
+  `);
+
+  // Migration: Add lastAccess column if it doesn't exist (for existing databases)
+  // Skip migration for in-memory databases
+  if (!skipMigration) {
+    try {
+      const tableInfo = db.prepare("PRAGMA table_info(cache)").all() as {name: string}[];
+      const hasLastAccess = tableInfo.some(col => col.name === 'lastAccess');
+
+      if (!hasLastAccess) {
+        console.log('Migrating cache database: adding lastAccess column');
+        db.exec('ALTER TABLE cache ADD COLUMN lastAccess INTEGER DEFAULT 0');
+      }
+    } catch (error) {
+      // If migration fails, might be an old database - recreate it
+      console.warn('Cache migration failed, recreating database:', error);
+      db.exec('DROP TABLE IF EXISTS cache');
+      db.exec(`
+        CREATE TABLE cache(
+          key TEXT PRIMARY KEY,
+          value TEXT,
+          timestamp INTEGER,
+          lastAccess INTEGER
+        ) STRICT
+      `);
+    }
+  }
+
+  // Add index on lastAccess for efficient LRU queries
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_cache_lastAccess ON cache(lastAccess)
+  `);
+
+  // Add index on timestamp for efficient cleanup
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON cache(timestamp)
+  `);
+
+  // ── Attractions.io entity store ──────────────────────────────────
+  // Normalized per-record storage replacing the old giant JSON blob in the cache table.
+  // Each Item/Category/Resort gets its own row, with soft-delete tracking.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attractionsio_entities (
+      park_id       TEXT NOT NULL,
+      record_type   TEXT NOT NULL,
+      entity_id     TEXT NOT NULL,
+      data          TEXT NOT NULL,
+      last_version  TEXT NOT NULL,
+      removed_at    INTEGER,
+      updated_at    INTEGER NOT NULL,
+      PRIMARY KEY (park_id, record_type, entity_id)
+    ) STRICT
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attractionsio_versions (
+      park_id       TEXT PRIMARY KEY,
+      version       TEXT NOT NULL,
+      updated_at    INTEGER NOT NULL
+    ) STRICT
+  `);
+}
+
+/**
+ * Apply the pragmas the cache relies on.
+ *
+ * WAL lets readers and writers work simultaneously, and busy_timeout waits out
+ * a competing writer instead of throwing SQLITE_BUSY.
+ *
+ * synchronous=NORMAL: with WAL, fsync happens at checkpoints rather than per
+ * commit. This is the hot HTTP-response cache — hammered during a park's
+ * entity/sync sweep — and DatabaseSync is synchronous, so per-commit fsync on
+ * a slow or saturated disk stalls the caller's event loop. NORMAL only risks
+ * losing the last uncheckpointed cache rows on a hard crash, and those are
+ * just re-fetched.
+ *
+ * On an in-memory database `journal_mode` stays `memory` — WAL needs a file —
+ * but `busy_timeout` and `synchronous` do apply. None of the three throws
+ * there, so the catch below is not for that case: it is for a real failure
+ * such as another process holding the database, which would otherwise leave us
+ * running on `journal_mode=delete` with `synchronous=FULL` in silence.
+ *
+ * @internal Exported so a test can prove the behaviour against a real on-disk
+ * database. Not part of the supported package surface.
+ */
+export function applyPersistencePragmas(db: DatabaseSync): void {
+  try {
+    db.exec('PRAGMA journal_mode=WAL');
+    db.exec('PRAGMA busy_timeout=5000');
+    db.exec('PRAGMA synchronous=NORMAL');
+  } catch (err) {
+    console.warn('Cache: failed to apply persistence pragmas, continuing on SQLite defaults:', err);
+  }
+}
+
+/**
+ * Open a cache database.
+ *
+ * The single construction path, so a cache database without its pragmas is not
+ * a state this module can reach. Pragmas go on BEFORE the schema deliberately:
+ * `initializeDatabase` runs five DDL statements, and running those under the
+ * default `journal_mode=delete` + `synchronous=FULL` costs roughly eight times
+ * as much on a cold start (p50 2572ms against 324ms, measured on a loaded
+ * machine) — synchronously, at import time, blocking the event loop.
+ *
+ * @internal
+ */
+export function openDatabase(path: string, skipMigration: boolean = false): DatabaseSync {
+  const db = new DatabaseSync(path);
+  applyPersistencePragmas(db);
+  initializeDatabase(db, skipMigration);
+  return db;
+}
+
+database = openDatabase(CACHE_DB_PATH);
+
+// Cleanup interval reference
+let cleanupIntervalId: ReturnType<typeof setInterval> | null = null;
+
+// Size limit enforcement runs every N inserts rather than every insert.
+// At 50k entries (default MAX_CACHE_ENTRIES), the limit is rarely exceeded,
+// so a SELECT COUNT(*) on every set() is wasted work.
+const SIZE_CHECK_INTERVAL = 100;
+let insertsSinceLastSizeCheck = 0;
+
+class CacheLib {
+  /**
+   * Enable temporary mode - use in-memory cache that doesn't persist
+   * Must be called before any cache operations
+   */
+  static enableTemporaryMode(): void {
+    if (isTemporaryMode) {
+      return; // Already in temporary mode
+    }
+
+    console.log('Cache: Switching to temporary in-memory mode');
+    isTemporaryMode = true;
+
+    // Stop cleanup if running
+    this.stopCleanup();
+
+    // Create new in-memory database (skip migration — nothing to migrate)
+    database = openDatabase(':memory:', true);
+  }
+
+  /**
+   * Check if cache is in temporary mode
+   */
+  static isTemporary(): boolean {
+    return isTemporaryMode;
+  }
+
+  static get(key: string): any | null {
+    try {
+      const stmt = database.prepare('SELECT value, timestamp FROM cache WHERE key = ?');
+      const row = stmt.get(key) as {value: string, timestamp: number} | undefined;
+
+      if (row) {
+        const isExpired = Date.now() > row.timestamp;
+        if (isExpired) {
+          this.delete(key);
+          return null;
+        }
+
+        // Update last access time for LRU — best-effort, don't fail the read
+        try {
+          const updateStmt = database.prepare('UPDATE cache SET lastAccess = ? WHERE key = ?');
+          updateStmt.run(Date.now(), key);
+        } catch {
+          // LRU tracking is non-critical; stale lastAccess is acceptable
+        }
+
+        return JSON.parse(row.value);
+      }
+      return null;
+    } catch (error) {
+      console.error("Cache get error:", error);
+      return null;
+    }
+  }
+
+  static set<T>(key: string, value: T, ttlSeconds: number = 60): void {
+    // Warn on types that don't survive JSON serialization
+    if (value instanceof Set || value instanceof Map) {
+      console.warn(
+        `[Cache] Warning: Storing ${value.constructor.name} in cache key "${key}". ` +
+        `Set/Map objects become plain objects after JSON serialization. ` +
+        `Use arrays or Record<string, T> instead.`
+      );
+    } else if (value instanceof Date) {
+      console.warn(
+        `[Cache] Warning: Storing Date in cache key "${key}". ` +
+        `Date objects become ISO strings after JSON serialization. ` +
+        `Store as ISO string directly if that's the intent.`
+      );
+    }
+
+    // JSON.stringify(undefined) returns undefined (not a string), which SQLite STRICT mode rejects.
+    // It also throws on circular references. Skip storage in both cases.
+    let serialized: string | undefined;
+    try {
+      serialized = JSON.stringify(value);
+    } catch {
+      return;
+    }
+    if (serialized === undefined) {
+      return;
+    }
+
+    try {
+      const timestamp = Date.now() + (ttlSeconds * 1000);
+      const now = Date.now();
+
+      const stmt = database.prepare('INSERT OR REPLACE INTO cache (key, value, timestamp, lastAccess) VALUES (?, ?, ?, ?)');
+      stmt.run(key, serialized, timestamp, now);
+
+      // Check if we need to evict entries after insert.
+      // Only run the SELECT COUNT(*) periodically (every SIZE_CHECK_INTERVAL inserts)
+      // to avoid a full table scan on every write.
+      insertsSinceLastSizeCheck++;
+      if (insertsSinceLastSizeCheck >= SIZE_CHECK_INTERVAL) {
+        insertsSinceLastSizeCheck = 0;
+        this.enforceSizeLimit();
+      }
+    } catch (error) {
+      console.error("Cache set error:", error);
+    }
+  }
+
+  static delete(key: string): void {
+    try {
+      const stmt = database.prepare('DELETE FROM cache WHERE key = ?');
+      stmt.run(key);
+    } catch (error) {
+      console.error("Cache delete error:", error);
+    }
+  }
+
+  /**
+   * Delete cached entries.
+   *
+   * Like {@link clearByClassName}, this is a re-fetch and steps over
+   * persistent operational state (see cacheKeys.ts). The broad gesture is the
+   * one an operator reaches for when a symptom spans several destinations,
+   * which is exactly when quietly discarding what we have observed does the
+   * most damage. Pass `includePersistent` for a genuine full wipe.
+   */
+  static clear({includePersistent = false}: {includePersistent?: boolean} = {}): void {
+    try {
+      const {clauses, params} = includePersistent
+        ? {clauses: [] as string[], params: [] as string[]}
+        : persistentKeyExclusion();
+      const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
+      database.prepare(`DELETE FROM cache${where}`).run(...params);
+    } catch (error) {
+      console.error("Cache clear error:", error);
+    }
+  }
+
+  static has(key: string): boolean {
+    try {
+      const stmt = database.prepare('SELECT 1 FROM cache WHERE key = ? AND timestamp > ?');
+      const row = stmt.get(key, Date.now());
+      return !!row;
+    } catch (error) {
+      console.error("Cache has error:", error);
+      return false;
+    }
+  }
+
+  static keys(): string[] {
+    try {
+      const stmt = database.prepare('SELECT key FROM cache WHERE timestamp > ?');
+      const rows = stmt.all(Date.now()) as {key: string}[];
+      return rows.map(row => row.key);
+    } catch (error) {
+      console.error("Cache keys error:", error);
+      return [];
+    }
+  }
+
+  static size(): number {
+    try {
+      const stmt = database.prepare('SELECT COUNT(*) as count FROM cache');
+      const row = stmt.get() as {count: number};
+      return row.count;
+    } catch (error) {
+      console.error("Cache size error:", error);
+      return 0;
+    }
+  }
+
+  /**
+   * Get all cache entries with metadata
+   */
+  static getAllEntries(): Array<{
+    key: string;
+    value: any;
+    expiresAt: number;
+    lastAccess: number;
+    size: number;
+    isExpired: boolean;
+  }> {
+    try {
+      const stmt = database.prepare('SELECT key, value, timestamp, lastAccess FROM cache');
+      const rows = stmt.all() as Array<{key: string, value: string, timestamp: number, lastAccess: number}>;
+      const now = Date.now();
+
+      return rows.map(row => ({
+        key: row.key,
+        value: JSON.parse(row.value),
+        expiresAt: row.timestamp,
+        lastAccess: row.lastAccess,
+        size: row.value.length,
+        isExpired: now > row.timestamp,
+      }));
+    } catch (error) {
+      console.error("Cache getAllEntries error:", error);
+      return [];
+    }
+  }
+
+  /**
+   * Enforce cache size limit by removing least recently accessed entries.
+   * Called periodically from set() rather than on every write.
+   */
+  static enforceSizeLimit(): void {
+    try {
+      const currentSize = this.size();
+      if (currentSize > MAX_CACHE_ENTRIES) {
+        const entriesToRemove = currentSize - MAX_CACHE_ENTRIES;
+        // Persistent rows are exempt here too, or the 400-day TTL on the
+        // retirement record would only be as good as the size cap: a
+        // destination that stops being polled ages to the cold end of the LRU
+        // and would be evicted despite never expiring. They are bounded (a
+        // handful per destination) so exempting them cannot starve eviction.
+        const {clauses, params} = persistentKeyExclusion();
+        const filter = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
+        const stmt = database.prepare(`
+          DELETE FROM cache WHERE key IN (
+            SELECT key FROM cache${filter} ORDER BY lastAccess ASC LIMIT ?
+          )
+        `);
+        stmt.run(...params, entriesToRemove);
+      }
+    } catch (error) {
+      console.error("Cache size enforcement error:", error);
+    }
+  }
+
+  /**
+   * Remove all expired entries from cache
+   */
+  static cleanupExpired(): number {
+    try {
+      const stmt = database.prepare('DELETE FROM cache WHERE timestamp <= ?');
+      const result = stmt.run(Date.now());
+      return Number(result.changes || 0);
+    } catch (error) {
+      console.error("Cache cleanup error:", error);
+      return 0;
+    }
+  }
+
+  /**
+   * Start automatic cleanup of expired entries
+   */
+  static startCleanup(): void {
+    if (cleanupIntervalId) {
+      return; // Already running
+    }
+    cleanupIntervalId = setInterval(() => {
+      const removed = this.cleanupExpired();
+      if (removed > 0) {
+        console.log(`Cache cleanup: removed ${removed} expired entries`);
+      }
+    }, CLEANUP_INTERVAL_MS);
+
+    // Don't block Node.js from exiting
+    cleanupIntervalId.unref();
+  }
+
+  /**
+   * Stop automatic cleanup
+   */
+  static stopCleanup(): void {
+    if (cleanupIntervalId) {
+      clearInterval(cleanupIntervalId);
+      cleanupIntervalId = null;
+    }
+  }
+
+  /**
+   * Get cache statistics
+   */
+  static stats(): {total: number, expired: number, active: number} {
+    try {
+      const totalStmt = database.prepare('SELECT COUNT(*) as count FROM cache');
+      const expiredStmt = database.prepare('SELECT COUNT(*) as count FROM cache WHERE timestamp <= ?');
+
+      const total = (totalStmt.get() as {count: number}).count;
+      const expired = (expiredStmt.get(Date.now()) as {count: number}).count;
+
+      return {
+        total,
+        expired,
+        active: total - expired
+      };
+    } catch (error) {
+      console.error("Cache stats error:", error);
+      return {total: 0, expired: 0, active: 0};
+    }
+  }
+
+  /**
+   * Delete all cache entries whose key contains the given class name.
+   * Matches both plain keys (`ClassName:method:args`) and prefixed keys (`prefix:ClassName:method:args`).
+   * Returns the number of deleted entries.
+   *
+   * Keys carrying a {@link PERSISTENT_KEY_FRAGMENTS} fragment are stepped
+   * over: this call means "refetch from upstream", not "forget what we have
+   * observed". Pass `includePersistent` to sweep those too, which is a full
+   * reset of the destination rather than a flush, and is what test setup
+   * wants.
+   */
+  static clearByClassName(
+    className: string,
+    {includePersistent = false}: {includePersistent?: boolean} = {},
+  ): number {
+    try {
+      const clauses = ['(key LIKE ? OR key LIKE ?)'];
+      const params: string[] = [`${className}:%`, `%:${className}:%`];
+      if (!includePersistent) {
+        const exclusion = persistentKeyExclusion();
+        clauses.push(...exclusion.clauses);
+        params.push(...exclusion.params);
+      }
+      const stmt = database.prepare(`DELETE FROM cache WHERE ${clauses.join(' AND ')}`);
+      const result = stmt.run(...params);
+      return Number(result.changes || 0);
+    } catch (error) {
+      console.error("Cache clearByClassName error:", error);
+      return 0;
+    }
+  }
+
+  /**
+   * Delete cached entries across every destination. Returns number deleted.
+   *
+   * Steps over persistent operational state for the same reason
+   * {@link clearByClassName} does; pass `includePersistent` for a full wipe.
+   */
+  static clearAll({includePersistent = false}: {includePersistent?: boolean} = {}): number {
+    try {
+      const {clauses, params} = includePersistent
+        ? {clauses: [] as string[], params: [] as string[]}
+        : persistentKeyExclusion();
+      const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
+      const result = database.prepare(`DELETE FROM cache${where}`).run(...params);
+      return Number(result.changes || 0);
+    } catch (error) {
+      console.error("Cache clearAll error:", error);
+      return 0;
+    }
+  }
+
+  private static inflight = new Map<string, Promise<any>>();
+
+  /**
+   * Cache-with-dedup wrapper. Concurrent callers on a cache miss for the same
+   * key share a single execution rather than each running `fn` independently.
+   *
+   * @param ttl Either a fixed TTL in seconds, or a callback that derives a TTL
+   *            from the function's result (e.g. for OAuth tokens that expire
+   *            on a server-supplied schedule).
+   */
+  static async wrap<T>(
+    key: string,
+    fn: () => T | Promise<T>,
+    ttl: number | ((result: T) => number | Promise<number>),
+  ): Promise<T> {
+    if (this.has(key)) {
+      const cachedValue = this.get(key);
+      if (cachedValue !== null) {
+        return cachedValue as T;
+      }
+    }
+
+    // In-flight deduplication: concurrent cache misses on the same key share one execution
+    if (this.inflight.has(key)) {
+      return this.inflight.get(key) as Promise<T>;
+    }
+
+    const promise = Promise.resolve(fn()).then(async (result) => {
+      const ttlSeconds = typeof ttl === 'function' ? await ttl(result) : ttl;
+      this.set(key, result, ttlSeconds);
+      this.inflight.delete(key);
+      return result;
+    }).catch((err) => {
+      this.inflight.delete(key);
+      throw err;
+    });
+
+    this.inflight.set(key, promise);
+    return promise;
+  }
+}
+
+export default function cacheDecorator({ttlSeconds = 60, callback, key, cacheVersion}: {ttlSeconds?: number, callback?: (response: any) => number, key?: string | ((this: any, args: any[]) => string | Promise<string>), cacheVersion?: number | string} = {}) {
+  return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
+    const originalMethod = descriptor.value;
+    descriptor.value = async function (this: any, ...args: any[]) {
+      // Include class name in cache key to prevent collisions between different classes
+      const className = this.constructor.name;
+
+      // Check for cache key prefix (supports both method and property)
+      let prefix = '';
+      if (typeof this.getCacheKeyPrefix === 'function') {
+        const result = this.getCacheKeyPrefix();
+        prefix = result instanceof Promise ? await result : result;
+      } else if (this.cacheKeyPrefix) {
+        prefix = this.cacheKeyPrefix;
+      }
+
+      // Version suffix: when this changes, old cache entries become unreachable
+      // and expire naturally — no manual cache flush needed across machines.
+      // Precedence: method-level option > class getCacheVersion() > class
+      // cacheVersion property > unversioned.
+      let resolvedVersion: number | string | undefined = cacheVersion;
+      if (resolvedVersion === undefined) {
+        if (typeof this.getCacheVersion === 'function') {
+          const v = this.getCacheVersion(propertyKey);
+          resolvedVersion = v instanceof Promise ? await v : v;
+        } else if (this.cacheVersion !== undefined) {
+          resolvedVersion = this.cacheVersion;
+        }
+      }
+      const versionSuffix = resolvedVersion !== undefined && resolvedVersion !== null && resolvedVersion !== '' ? `:v${resolvedVersion}` : '';
+
+      let cacheKey: string;
+
+      if (key) {
+        if (typeof key === 'string') {
+          cacheKey = prefix ? `${prefix}:${key}${versionSuffix}` : `${key}${versionSuffix}`;
+        } else {
+          const customKey = await key.call(this, args);
+          cacheKey = prefix ? `${prefix}:${customKey}${versionSuffix}` : `${customKey}${versionSuffix}`;
+        }
+      } else {
+        const defaultKey = `${className}:${propertyKey}:${JSON.stringify(args)}${versionSuffix}`;
+        cacheKey = prefix ? `${prefix}:${defaultKey}` : defaultKey;
+      }
+
+      // Use wrap for both fixed and dynamic TTL — both paths get in-flight
+      // deduplication so concurrent cache misses share a single execution.
+      // Critical for OAuth token refresh: without dedup, two concurrent
+      // callers would both hit the token endpoint and the second's response
+      // would overwrite the first in cache.
+      return await CacheLib.wrap(
+        cacheKey,
+        () => originalMethod.apply(this, args),
+        callback ?? ttlSeconds,
+      );
+    };
+  };
+}
+
+
+export {CacheLib, cacheDecorator as cache};

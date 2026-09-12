@@ -1,0 +1,338 @@
+/**
+ * Destination Registry - Decorator-based automatic destination registration
+ * Destinations register themselves using the @destinationController decorator
+ * Automatically discovers and loads all destination implementations
+ */
+
+import {Destination} from './destination.js';
+import config from './config.js';
+import * as fs from 'fs';
+import * as path from 'path';
+import {fileURLToPath} from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/**
+ * Convert class name to a lowercase ID (no separators).
+ * UniversalOrlando -> universalorlando
+ */
+function classNameToId(className: string): string {
+  return className.toLowerCase().replace(/\s+/g, '');
+}
+
+/**
+ * Convert class name to display name
+ * UniversalOrlando -> Universal Orlando
+ */
+function classNameToDisplayName(className: string): string {
+  return className
+    .replace(/([A-Z])/g, ' $1')
+    .trim();
+}
+
+export type DestinationRegistryEntry = {
+  /** Unique identifier for the destination (derived from class name) */
+  id: string;
+  /** Display name (derived from class name) */
+  name: string;
+  /** Destination class constructor */
+  DestinationClass: new () => Destination;
+  /** Category or categories for grouping */
+  category: string | string[];
+  /** Source file path (for type generation) */
+  sourceFilePath?: string;
+};
+
+/**
+ * Central registry of all destinations (populated by @destinationController decorator)
+ */
+const DESTINATION_REGISTRY: DestinationRegistryEntry[] = [];
+
+/**
+ * Track if destinations have been loaded.
+ * `loadPromise` holds the in-flight load so concurrent callers share one
+ * filesystem scan rather than racing.
+ */
+let destinationsLoaded = false;
+let loadPromise: Promise<void> | null = null;
+
+/**
+ * Recursively find all TypeScript/JavaScript files in a directory
+ */
+function findDestinationFiles(dir: string, fileExtension: string = '.js'): string[] {
+  const files: string[] = [];
+
+  try {
+    const entries = fs.readdirSync(dir, {withFileTypes: true});
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        // Skip node_modules, __tests__, and hidden directories
+        if (!entry.name.startsWith('.') &&
+            !entry.name.startsWith('_') &&
+            entry.name !== 'node_modules') {
+          files.push(...findDestinationFiles(fullPath, fileExtension));
+        }
+      } else if (entry.isFile()) {
+        // Include TypeScript or JavaScript files (depending on if we're built)
+        if (entry.name.endsWith(fileExtension) &&
+            !entry.name.endsWith('.d.ts') &&
+            !entry.name.endsWith('.test.ts') &&
+            !entry.name.endsWith('.test.js')) {
+          files.push(fullPath);
+        }
+      }
+    }
+  } catch (error) {
+    // Silently ignore if directory doesn't exist
+  }
+
+  return files;
+}
+
+/**
+ * Load all destination implementations
+ * Imports all TypeScript/JavaScript files from the parks directory
+ * This triggers the @destinationController decorators to register destinations
+ */
+async function loadAllDestinations(): Promise<void> {
+  if (destinationsLoaded) return;
+  // If a load is already in progress, return its promise so concurrent
+  // callers share a single filesystem scan instead of racing.
+  if (loadPromise) return loadPromise;
+
+  loadPromise = (async () => {
+    // Determine if we're running from src (TS) or dist (JS)
+    const currentDir = __dirname;
+    const isBuilt = currentDir.includes('dist');
+    const fileExtension = isBuilt ? '.js' : '.ts';
+
+    // Find the parks directory relative to this file
+    const parksDir = path.join(__dirname, 'parks');
+
+    if (!fs.existsSync(parksDir)) {
+      destinationsLoaded = true; // Nothing to load; mark done so we don't re-check on every call
+      return;
+    }
+
+    // Find all destination files
+    const destinationFiles = findDestinationFiles(parksDir, fileExtension);
+
+    // Import all files to trigger decorators
+    const importPromises = destinationFiles.map(async (file) => {
+      try {
+        // Convert absolute path to relative import path
+        const relativePath = path.relative(__dirname, file);
+        const importPath = './' + relativePath.replace(/\\/g, '/').replace(/\.(ts|js)$/, '.js');
+
+        await import(importPath);
+      } catch (error) {
+        // Log import errors in development mode for debugging
+        if (process.env.NODE_ENV !== 'production') {
+          console.error(`[destinationRegistry] Failed to import destination file: ${file}\n`, error);
+        }
+      }
+    });
+
+    await Promise.all(importPromises);
+    destinationsLoaded = true;
+  })();
+
+  return loadPromise;
+}
+
+/**
+ * Ensure destinations are loaded before accessing registry
+ */
+async function ensureDestinationsLoaded(): Promise<void> {
+  if (!destinationsLoaded) {
+    await loadAllDestinations();
+  }
+}
+
+/**
+ * Destination controller decorator options
+ */
+export type DestinationControllerOptions = {
+  /** Category or categories for grouping (e.g., 'Universal' or ['Universal', 'Florida']) */
+  category: string | string[];
+};
+
+/**
+ * Destination controller decorator - Automatically registers a destination class
+ * ID and name are derived from the class name
+ *
+ * @example
+ * ```typescript
+ * @destinationController({ category: 'Universal' })
+ * export class UniversalOrlando extends Destination {
+ *   // ID: 'universalorlando'
+ *   // Name: 'Universal Orlando'
+ * }
+ *
+ * @destinationController({ category: ['Six Flags', 'California'] })
+ * export class SixFlagsMagicMountain extends Destination {
+ *   // ID: 'sixflagsmagicmountain'
+ *   // Name: 'Six Flags Magic Mountain'
+ * }
+ * ```
+ */
+export function destinationController(options: DestinationControllerOptions) {
+  return function <T extends new (...args: any[]) => Destination>(target: T) {
+    const className = target.name;
+    const id = classNameToId(className);
+    const name = classNameToDisplayName(className);
+
+    // Try to capture source file path from stack trace
+    let sourceFilePath: string | undefined;
+    try {
+      const stack = new Error().stack;
+      if (stack) {
+        // Parse stack trace to find the file that called this decorator
+        // Stack format: "    at <location> (file:///path/to/file.ts:line:col)"
+        const lines = stack.split('\n');
+        for (const line of lines) {
+          // Look for file:// URLs in the stack
+          const match = line.match(/file:\/\/(.+?):\d+:\d+/);
+          if (match && match[1]) {
+            const filePath = match[1];
+            // Skip this file (destinationRegistry.ts)
+            if (!filePath.includes('destinationRegistry')) {
+              sourceFilePath = filePath;
+              break;
+            }
+          }
+        }
+      }
+    } catch (error) {
+      // Ignore errors in capturing source file path
+    }
+
+    // Apply @config to ensure the class has config proxy support.
+    // This must happen before registration so the registry stores the
+    // proxy-wrapped class, not the raw class. Without this, @config
+    // property resolution (env vars) silently fails when instances
+    // are created via the registry.
+    const configWrapped = config(target) as T ?? target;
+
+    // Register the destination in the global registry
+    DESTINATION_REGISTRY.push({
+      id,
+      name,
+      DestinationClass: configWrapped as unknown as new () => Destination,
+      category: options.category,
+      sourceFilePath,
+    });
+
+    // Return the config-wrapped class
+    return configWrapped;
+  };
+}
+
+/**
+ * Get all registered destinations
+ * Automatically loads destinations on first call
+ */
+export async function getAllDestinations(): Promise<DestinationRegistryEntry[]> {
+  await ensureDestinationsLoaded();
+  return [...DESTINATION_REGISTRY]; // Return copy to prevent mutation
+}
+
+/**
+ * Get destination by ID
+ * Automatically loads destinations on first call
+ */
+export async function getDestinationById(id: string): Promise<DestinationRegistryEntry | undefined> {
+  await ensureDestinationsLoaded();
+  return DESTINATION_REGISTRY.find(d => d.id === id);
+}
+
+/**
+ * Get destinations by category (matches if destination has category or contains category in array)
+ * Automatically loads destinations on first call
+ */
+export async function getDestinationsByCategory(category: string): Promise<DestinationRegistryEntry[]> {
+  await ensureDestinationsLoaded();
+  return DESTINATION_REGISTRY.filter(d => {
+    if (Array.isArray(d.category)) {
+      return d.category.includes(category);
+    }
+    return d.category === category;
+  });
+}
+
+/**
+ * Get all unique categories
+ * Automatically loads destinations on first call
+ */
+export async function getAllCategories(): Promise<string[]> {
+  await ensureDestinationsLoaded();
+  const categories = new Set<string>();
+  DESTINATION_REGISTRY.forEach(destination => {
+    if (Array.isArray(destination.category)) {
+      destination.category.forEach(cat => categories.add(cat));
+    } else {
+      categories.add(destination.category);
+    }
+  });
+  return Array.from(categories).sort();
+}
+
+/**
+ * List all available destination IDs
+ * Automatically loads destinations on first call
+ */
+export async function listDestinationIds(): Promise<string[]> {
+  await ensureDestinationsLoaded();
+  return DESTINATION_REGISTRY.map(d => d.id);
+}
+
+/**
+ * Get registry size (for debugging)
+ * Automatically loads destinations on first call
+ */
+export async function getRegistrySize(): Promise<number> {
+  await ensureDestinationsLoaded();
+  return DESTINATION_REGISTRY.length;
+}
+
+/**
+ * Manually register an external destination class.
+ *
+ * Use this when the destination lives in a separate repo and can't be
+ * auto-discovered from the parks/ directory. The class should extend
+ * Destination and use property-level @config decorators for configuration —
+ * the class-level config wrapper is applied automatically here, matching
+ * the behavior of @destinationController.
+ *
+ * @example
+ * ```typescript
+ * import {registerDestination} from '@themeparks/parksapi';
+ * import {DisneyWorldResort} from './disney/wdw.js';
+ *
+ * registerDestination({
+ *   id: 'disneyworldresort',
+ *   name: 'Walt Disney World Resort',
+ *   DestinationClass: DisneyWorldResort,
+ *   category: 'Disney',
+ * });
+ * ```
+ */
+export function registerDestination(entry: DestinationRegistryEntry): void {
+  // Prevent duplicates
+  const existing = DESTINATION_REGISTRY.find(d => d.id === entry.id);
+  if (existing) return;
+
+  // Apply @config wrapping so property-level @config decorators resolve env
+  // vars correctly. Without this, externally-registered destinations would
+  // silently miss env var configuration unless the consumer manually applied
+  // the class decorator themselves.
+  const configWrapped = (config(entry.DestinationClass) as typeof entry.DestinationClass) ?? entry.DestinationClass;
+  DESTINATION_REGISTRY.push({
+    ...entry,
+    DestinationClass: configWrapped,
+  });
+}

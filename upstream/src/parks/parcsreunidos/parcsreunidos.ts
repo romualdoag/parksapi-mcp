@@ -1,0 +1,926 @@
+/**
+ * Parcs Reunidos (StayApp) Theme Park Framework
+ *
+ * Provides support for 6 Parcs Reunidos parks using the Stay-App API.
+ * Supports real-time wait times, entity data, and calendar schedules
+ * parsed from HTML pages.
+ *
+ * @module parcsreunidos
+ */
+
+import {Destination, type DestinationConstructor} from '../../destination.js';
+import config from '../../config.js';
+import {http, type HTTPObj} from '../../http.js';
+import {cache, CacheLib} from '../../cache.js';
+import {inject} from '../../injector.js';
+import {destinationController} from '../../destinationRegistry.js';
+import type {Entity, LiveData, EntitySchedule} from '@themeparks/typelib';
+import {constructDateTime} from '../../datetime.js';
+import {decodeHtmlEntities} from '../../htmlUtils.js';
+
+// ============================================================================
+// API Response Types
+// ============================================================================
+
+/** Park establishment info from the API */
+type StayAppEstablishment = {
+  data: {
+    name: string;
+    coordinates?: {
+      latitude: number;
+      longitude: number;
+    };
+  };
+};
+
+/** Single attraction from the attractions API */
+type StayAppAttraction = {
+  id: number;
+  translatableName?: Record<string, string>;
+  place?: {
+    point?: {
+      latitude: number;
+      longitude: number;
+    };
+  };
+  waitingTime?: number;
+};
+
+/** Attractions API response */
+type StayAppAttractionsResponse = {
+  data: StayAppAttraction[];
+};
+
+/**
+ * One attraction in Mirabilandia's own `attrazioni.json` wait-time feed.
+ *
+ * `wait_time` and the `note_*` pair are mutually exclusive: a ride that isn't
+ * currently taking guests carries a note and NO `wait_time` key at all — it is
+ * absent, not zero. `wait_time: 0` therefore means a genuine walk-on.
+ */
+type CodeattrAttraction = {
+  closed?: number;
+  wait_time?: number;
+  note_it?: string;
+  note_en?: string;
+};
+
+/** Mirabilandia `attrazioni.json` response */
+type CodeattrAttractionsResponse = {
+  /** Feed generation time, `YYYY-MM-DD HH:mm:ss` in Europe/Rome local time */
+  timestamp?: string;
+  attrazioni?: Record<string, CodeattrAttraction>;
+};
+
+/** Mirabilandia `info.json` response */
+type CodeattrInfo = {
+  isopen?: boolean;
+  manual_override?: boolean;
+  override_value?: unknown;
+  halloween_open?: boolean;
+};
+
+// ============================================================================
+// Base Class
+// ============================================================================
+
+/**
+ * Base class for Parcs Reunidos parks using the Stay-App API.
+ *
+ * NOT registered as a destination. Subclasses use @destinationController
+ * to register individual parks.
+ */
+@config
+class ParcsReunidosDestination extends Destination {
+  /** Per-park app ID for establishment endpoint */
+  @config
+  appId: string = '';
+
+  /**
+   * URL of the Stay-App Weex JS bundle that carries the shared PWA bearer
+   * as a build-time config constant (`i.bearerPWA={bearer:"..."}`) — a
+   * static, long-lived service-account token, not something obtained via
+   * login. Identical across every Parcs Reunidos / Stay-App-powered park
+   * (confirmed by comparing live captures from two different park apps);
+   * it only changes when Stay-App next rebuilds this shared bundle.
+   * Requires the `isBundleRequest: true` header — without it the server
+   * serves a different bundle variant that doesn't carry this constant.
+   */
+  @config
+  bearerBundleUrl: string = '';
+
+  /** Per-park establishment identifier for API header */
+  @config
+  stayEstablishment: string = '';
+
+  /** Per-park calendar URL for schedule scraping */
+  @config
+  calendarUrl: string = '';
+
+  /** Shared base URL for the Stay-App API */
+  @config
+  baseUrl: string = '';
+
+  /** Park timezone */
+  @config
+  timezone: string = 'Europe/Berlin';
+
+  constructor(options?: DestinationConstructor) {
+    super(options);
+    this.addConfigPrefix('STAYAPP');
+  }
+
+  /**
+   * Generate cache key prefix to prevent cache collisions between parks.
+   * Each park has a unique appId.
+   */
+  getCacheKeyPrefix(): string {
+    return `parcsreunidos:${this.appId}`;
+  }
+
+  // ============================================================================
+  // Header Injection
+  // ============================================================================
+
+  /**
+   * Inject Authorization and Stay-Establishment headers for API requests.
+   * Uses dynamic hostname matching based on configured baseUrl.
+   */
+  @inject({
+    eventName: 'httpRequest',
+    hostname: function () {
+      if (!this.baseUrl) return undefined;
+      try {
+        return new URL(this.baseUrl).hostname;
+      } catch {
+        return undefined;
+      }
+    },
+  })
+  async injectHeaders(requestObj: HTTPObj): Promise<void> {
+    requestObj.headers = {
+      ...requestObj.headers,
+      'Stay-Establishment': this.stayEstablishment,
+    };
+    // Every Stay-App endpoint requires this header, but the API rejects a
+    // malformed `Bearer ` (empty token) with AUTHORIZATION_HEADER_BAD_FORMED
+    // — worse than simply omitting the header and letting the request 401
+    // normally — so only set it when a real token was obtained.
+    try {
+      const token = await this.getAccessToken();
+      if (token) requestObj.headers['Authorization'] = `Bearer ${token}`;
+    } catch (err: any) {
+      console.warn(`[${this.constructor.name}] Stay-App bearer unavailable: ${err?.message ?? err}`);
+    }
+  }
+
+  // ============================================================================
+  // HTTP Fetch Methods
+  // ============================================================================
+
+  /**
+   * Fetch park establishment info (name, coordinates).
+   * Cached for 12 hours at HTTP level.
+   */
+  @http({cacheSeconds: 43200})
+  async fetchEstablishment(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.baseUrl}/api/v1/establishment/${this.appId}`,
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Fetch attractions list (entity data + live wait times).
+   * Cached for 1 minute at HTTP level.
+   */
+  @http({cacheSeconds: 60})
+  async fetchAttractions(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.baseUrl}/api/v1/service/attraction`,
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Fetch calendar HTML page for schedule scraping.
+   * Cached for 24 hours at HTTP level.
+   */
+  @http({cacheSeconds: 86400})
+  async fetchCalendarHTML(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: this.calendarUrl,
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Fetch the Weex JS bundle carrying the shared PWA bearer. The
+   * `isBundleRequest` header and app-shaped user-agent are required —
+   * without them the server serves a different bundle variant that
+   * doesn't carry the `bearerPWA` config constant.
+   * Cached for 24 hours at HTTP level.
+   */
+  @http({cacheSeconds: 86400, retries: 2})
+  async fetchBearerBundle(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: this.bearerBundleUrl,
+      headers: {
+        'isBundleRequest': 'true',
+        'user-agent': 'WeexStayApp(WeexStay/1.5.0) Weex/0.28.0.1',
+      },
+    } as any as HTTPObj;
+  }
+
+  // ============================================================================
+  // Cached Getter Methods
+  // ============================================================================
+
+  /**
+   * Extract the shared PWA bearer from the Weex bundle's build-time config
+   * (`i.bearerPWA={bearer:"..."}`). Cached for 24 hours — this is a static,
+   * long-lived token that only changes when Stay-App rebuilds the bundle,
+   * not something needing frequent refresh. Throws on failure (missing
+   * bearerBundleUrl, fetch failure, or the constant not being found) rather
+   * than swallowing the error here — @cache/CacheLib.wrap doesn't cache a
+   * thrown error, so a transient failure costs one retry, not the full
+   * 24h TTL. injectHeaders() is responsible for tolerating the throw.
+   *
+   * Extraction is two-stage and order-independent: first isolate the
+   * `bearerPWA={...}` (or `bearerPWA:{...}`) sub-object, then find `bearer`
+   * within it regardless of key position — a single anchored regex on
+   * `bearerPWA={bearer:"..."` would silently stop matching the moment
+   * Stay-App's bundler reorders that object's keys or emits it as an
+   * object-literal property instead of an assignment.
+   *
+   * A short-lived failure backoff (separate from the 24h success cache,
+   * since CacheLib.wrap never caches a thrown error) prevents hammering
+   * the bundle with a fresh ~1MB fetch on every poll cycle across all 5
+   * parks if it becomes unreachable or changes shape.
+   */
+  @cache({ttlSeconds: 86400})
+  async getAccessToken(): Promise<string> {
+    if (!this.bearerBundleUrl) throw new Error('bearerBundleUrl not configured');
+
+    const failureCacheKey = `${this.constructor.name}:bearerBundleFetchFailed:${this.bearerBundleUrl}`;
+    if (CacheLib.get(failureCacheKey)) {
+      throw new Error('bearer bundle fetch recently failed, backing off');
+    }
+
+    try {
+      const resp = await this.fetchBearerBundle();
+      const bundle = await resp.text();
+      const objMatch = /bearerPWA\s*[:=]\s*\{([^}]*)\}/.exec(bundle);
+      const bearerMatch = objMatch ? /bearer\s*:\s*"([^"]+)"/.exec(objMatch[1]) : null;
+      if (!bearerMatch) throw new Error('bearerPWA constant not found in Weex bundle');
+      return bearerMatch[1];
+    } catch (err) {
+      // Back off 5 minutes before retrying a failing bundle fetch, rather
+      // than re-fetching ~1MB on every poll cycle during an outage.
+      CacheLib.set(failureCacheKey, true, 300);
+      throw err;
+    }
+  }
+
+  /**
+   * Get park establishment info (cached 12 hours).
+   */
+  @cache({ttlSeconds: 43200})
+  async getEstablishment(): Promise<StayAppEstablishment['data']> {
+    const resp = await this.fetchEstablishment();
+    const data: StayAppEstablishment = await resp.json();
+    return data?.data || {name: ''};
+  }
+
+  /**
+   * Get attractions data (cached 1 minute).
+   */
+  @cache({ttlSeconds: 60})
+  async getAttractions(): Promise<StayAppAttraction[]> {
+    const resp = await this.fetchAttractions();
+    const data: StayAppAttractionsResponse = await resp.json();
+    return Array.isArray(data?.data) ? data.data : [];
+  }
+
+  // ============================================================================
+  // Entity Building
+  // ============================================================================
+
+  async getDestinations(): Promise<Entity[]> {
+    const establishment = await this.getEstablishment();
+    const destinationId = `parquesreunidos_${this.appId}`;
+
+    return [{
+      id: destinationId,
+      name: establishment.name || destinationId,
+      entityType: 'DESTINATION',
+      timezone: this.timezone,
+      location: establishment.coordinates
+        ? {latitude: establishment.coordinates.latitude, longitude: establishment.coordinates.longitude}
+        : undefined,
+    } as Entity];
+  }
+
+  protected async buildEntityList(): Promise<Entity[]> {
+    const establishment = await this.getEstablishment();
+    const attractions = await this.getAttractions();
+
+    const destinationId = `parquesreunidos_${this.appId}`;
+    const parkId = `parquesreunidos_${this.appId}_park`;
+
+    const parkEntity: Entity = {
+      id: parkId,
+      name: establishment.name || parkId,
+      entityType: 'PARK',
+      parentId: destinationId,
+      destinationId,
+      timezone: this.timezone,
+      location: establishment.coordinates
+        ? {latitude: establishment.coordinates.latitude, longitude: establishment.coordinates.longitude}
+        : undefined,
+    } as Entity;
+
+    const attractionEntities = this.mapEntities(attractions, {
+      idField: (item) => String(item.id),
+      nameField: (item) => this.resolveAttractionName(item),
+      entityType: 'ATTRACTION',
+      parentIdField: () => parkId,
+      destinationId,
+      timezone: this.timezone,
+      locationFields: {
+        lat: (item: StayAppAttraction) => item.place?.point?.latitude,
+        lng: (item: StayAppAttraction) => item.place?.point?.longitude,
+      },
+    });
+
+    return [parkEntity, ...attractionEntities];
+  }
+
+  /**
+   * Resolve attraction name from translatableName.
+   * Tries 'en' first, then falls back through common languages.
+   */
+  private resolveAttractionName(item: StayAppAttraction): string {
+    const names = item.translatableName;
+    if (!names || typeof names !== 'object') return `Attraction ${item.id}`;
+
+    const fallbackOrder = ['en', 'nl', 'de', 'fr', 'es', 'it'];
+    for (const lang of fallbackOrder) {
+      if (names[lang]) return names[lang];
+    }
+
+    // Return any available name
+    const values = Object.values(names);
+    return values.length > 0 ? values[0] : `Attraction ${item.id}`;
+  }
+
+  // ============================================================================
+  // Live Data
+  // ============================================================================
+
+  protected async buildLiveData(): Promise<LiveData[]> {
+    const attractions = await this.getAttractions();
+    const liveData: LiveData[] = [];
+
+    for (const attraction of attractions) {
+      const rawWaitingTime = attraction.waitingTime;
+
+      // Skip entities with no waitingTime data
+      if (rawWaitingTime === undefined || rawWaitingTime === null) continue;
+
+      const entityId = String(attraction.id);
+      const ld: LiveData = {id: entityId, status: 'CLOSED'} as LiveData;
+
+      // `waitingTime` is only typed `number` at the TS level (an assertion
+      // over an unvalidated JSON response) — coerce via Number() before
+      // Number.isFinite, since Number.isFinite doesn't coerce and a
+      // numeric-string wait time would otherwise silently misclassify an
+      // operating ride as CLOSED. Matches this repo's established pattern
+      // for the same field shape (te2.ts, nigloland.ts).
+      const waitingTime = Number(rawWaitingTime);
+
+      // Negative sentinel values (-1, -2, -3, ...) all mean "not currently
+      // operating" — verified live against the app's own UI (shows
+      // "Geschlossen"/Closed) and cross-park data: -2 and -3 both behave
+      // identically (fresh, actively-updating, park-wide "not open" signals
+      // — different establishments apparently use different sentinel values
+      // for the same state). Nothing in the API distinguishes a genuine
+      // ride-is-down state from park/ride-not-open: `temporaryClosed`
+      // correlates with the long-stale -1 bucket (rides untouched for
+      // months/years — a removed/under-refurbishment signal), not with -2
+      // or -3, so there's no reliable DOWN signal here. Default to CLOSED.
+      if (Number.isFinite(waitingTime) && waitingTime >= 0) {
+        ld.status = 'OPERATING' as any;
+        ld.queue = {
+          STANDBY: {waitTime: waitingTime},
+        };
+      }
+
+      liveData.push(ld);
+    }
+
+    return liveData;
+  }
+
+  // ============================================================================
+  // Schedules (HTML Calendar Parsing)
+  // ============================================================================
+
+  protected async buildSchedules(): Promise<EntitySchedule[]> {
+    // If no calendar URL is configured, return empty schedules
+    if (!this.calendarUrl) {
+      return [];
+    }
+
+    const scheduleEntries = await this.parseCalendar();
+    const parkId = `parquesreunidos_${this.appId}_park`;
+
+    return [{
+      id: parkId,
+      schedule: scheduleEntries,
+    } as EntitySchedule];
+  }
+
+  /**
+   * Parse calendar HTML to extract schedule entries.
+   * Cached for 24 hours.
+   */
+  @cache({ttlSeconds: 86400})
+  async parseCalendar(): Promise<Array<{date: string; type: string; openingTime: string; closingTime: string}>> {
+    const resp = await this.fetchCalendarHTML();
+    const html = await resp.text();
+
+    // Extract labels JSON from hidden input
+    // Handle both value='...' (single quotes) and value="..." (double quotes)
+    const labelsMatch = html.match(/id="data-hour-labels"\s+value=["']([^"']*)["']/);
+    if (!labelsMatch) return [];
+
+    let labels: Array<Record<string, string>>;
+    try {
+      // Decode HTML entities (&#34; → ", &amp; → &, etc.) before JSON parsing
+      labels = JSON.parse(decodeHtmlEntities(labelsMatch[1]));
+    } catch {
+      console.warn(`[ParcsReunidos:${this.appId}] Failed to parse calendar labels JSON`);
+      return [];
+    }
+
+    // Build label lookup: single letter key -> time range string
+    const labelMap = new Map<string, string>();
+    for (const labelObj of labels) {
+      for (const [key, value] of Object.entries(labelObj)) {
+        labelMap.set(key, value);
+      }
+    }
+
+    // Extract year data from hidden inputs (handle both quote styles + HTML entities)
+    const yearRegex = /id="data-hour-(\d{4})"\s+value=["']([^"']*)["']/g;
+    const scheduleEntries: Array<{date: string; type: string; openingTime: string; closingTime: string}> = [];
+    let yearMatch;
+
+    while ((yearMatch = yearRegex.exec(html)) !== null) {
+      const year = parseInt(yearMatch[1], 10);
+      let monthsData: Array<Record<string, string>>;
+      try {
+        monthsData = JSON.parse(decodeHtmlEntities(yearMatch[2]));
+      } catch {
+        console.warn(`[ParcsReunidos:${this.appId}] Failed to parse calendar year ${year} JSON`);
+        continue;
+      }
+
+      // Process each month (0-indexed in the array)
+      for (let monthIdx = 0; monthIdx < monthsData.length; monthIdx++) {
+        const monthData = monthsData[monthIdx];
+        if (!monthData || typeof monthData !== 'object') continue;
+
+        const month = monthIdx + 1; // 1-indexed
+
+        for (const [dayStr, labelKey] of Object.entries(monthData)) {
+          const day = parseInt(dayStr, 10);
+          if (isNaN(day) || day < 1 || day > 31) continue;
+
+          // Some sites encode multiple sessions per day as a comma-separated
+          // list of label keys. Single-key days stay a one-element array.
+          const keys = String(labelKey).split(',').map(k => k.trim()).filter(Boolean);
+          const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+
+          const emitted: Array<{openingTime: string; closingTime: string; description?: string}> = [];
+          for (const k of keys) {
+            const timeLabel = labelMap.get(k);
+            if (!timeLabel) continue;
+            if (timeLabel.toLowerCase().includes('closed')) continue;
+
+            const hours = this.parseTimeRange(timeLabel);
+            if (!hours) continue;
+
+            emitted.push({
+              openingTime: constructDateTime(dateStr, hours.open, this.timezone),
+              closingTime: constructDateTime(dateStr, hours.close, this.timezone),
+              description: this.extractLabelDescription(timeLabel),
+            });
+          }
+
+          // Legacy rule: if only one session, always mark OPERATING (drop any
+          // description from an event-prefix). With multiple sessions, the
+          // first is OPERATING and the rest are INFO rows so downstream
+          // consumers see the extra windows (parallel venues, evening
+          // extensions, after-hours events).
+          if (emitted.length === 1) {
+            scheduleEntries.push({
+              date: dateStr,
+              type: 'OPERATING',
+              openingTime: emitted[0].openingTime,
+              closingTime: emitted[0].closingTime,
+            });
+          } else {
+            for (let i = 0; i < emitted.length; i++) {
+              const entry: {date: string; type: string; openingTime: string; closingTime: string; description?: string} = {
+                date: dateStr,
+                type: i === 0 ? 'OPERATING' : 'INFO',
+                openingTime: emitted[i].openingTime,
+                closingTime: emitted[i].closingTime,
+              };
+              if (i > 0 && emitted[i].description) {
+                entry.description = emitted[i].description;
+              }
+              scheduleEntries.push(entry);
+            }
+          }
+        }
+      }
+    }
+
+    return scheduleEntries;
+  }
+
+  /**
+   * Parse a time range string into open/close times.
+   *
+   * Supported formats:
+   * 1. "10am - 5pm" (AM/PM)
+   * 2. "10:30 - 17:00" (24h)
+   * 3. "10 tot 5u" (Dutch)
+   * 4. "11 a.m. – 7 p.m." (with dots and en-dash)
+   */
+  private parseTimeRange(label: string): {open: string; close: string} | null {
+    // Format 4: "11 a.m. – 7 p.m." (dots in am/pm, en-dash or hyphen)
+    const dotAmPmMatch = label.match(/(\d{1,2}(?::\d{2})?)\s*a\.m\.\s*[–\-]\s*(\d{1,2}(?::\d{2})?)\s*p\.m\./i);
+    if (dotAmPmMatch) {
+      const open = this.parseAmPmHour(dotAmPmMatch[1], 'am');
+      const close = this.parseAmPmHour(dotAmPmMatch[2], 'pm');
+      return {open, close};
+    }
+
+    // Format 1: "10am - 5pm" or "10:30am - 5:30pm"
+    const amPmMatch = label.match(/(\d{1,2}(?::\d{2})?)\s*(am|pm)\s*[–\-]\s*(\d{1,2}(?::\d{2})?)\s*(am|pm)/i);
+    if (amPmMatch) {
+      const open = this.parseAmPmHour(amPmMatch[1], amPmMatch[2]);
+      const close = this.parseAmPmHour(amPmMatch[3], amPmMatch[4]);
+      return {open, close};
+    }
+
+    // Format 3: "10 tot 5u" (Dutch format)
+    const dutchMatch = label.match(/(\d{1,2}(?::\d{2})?)\s*(?:tot|t\/m)\s*(\d{1,2}(?::\d{2})?)u?/i);
+    if (dutchMatch) {
+      const open = this.normalize24hTime(dutchMatch[1]);
+      const close = this.normalize24hTime(dutchMatch[2]);
+      return {open, close};
+    }
+
+    // Format 2: "10:30 - 17:00" (24h format)
+    const h24Match = label.match(/(\d{1,2}(?::\d{2})?)\s*[–\-]\s*(\d{1,2}(?::\d{2})?)/);
+    if (h24Match) {
+      const open = this.normalize24hTime(h24Match[1]);
+      const close = this.normalize24hTime(h24Match[2]);
+      return {open, close};
+    }
+
+    return null;
+  }
+
+  /**
+   * Parse an AM/PM hour string to 24h HH:mm format.
+   */
+  private parseAmPmHour(timeStr: string, meridiem: string): string {
+    const parts = timeStr.split(':');
+    let hour = parseInt(parts[0], 10);
+    const minutes = parts.length > 1 ? parts[1] : '00';
+
+    const isPm = meridiem.toLowerCase().startsWith('p');
+    if (isPm && hour !== 12) hour += 12;
+    if (!isPm && hour === 12) hour = 0;
+
+    return `${String(hour).padStart(2, '0')}:${minutes}`;
+  }
+
+  /**
+   * Strip the parseable time range out of a label and return what remains —
+   * the human-readable session name, e.g. "Halloween Horror Festival" from
+   * "Halloween Horror Festival - 22:00-03:00". Returns undefined when the
+   * label is just a bare time range.
+   */
+  private extractLabelDescription(label: string): string | undefined {
+    // Remove any am/pm time range, 24h time range, or Dutch "tot" range.
+    const stripped = label
+      .replace(/\d{1,2}(?::\d{2})?\s*a\.m\.\s*[–\-]\s*\d{1,2}(?::\d{2})?\s*p\.m\./i, '')
+      .replace(/\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*[–\-]\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)/i, '')
+      .replace(/\d{1,2}(?::\d{2})?\s*(?:tot|t\/m)\s*\d{1,2}(?::\d{2})?u?/i, '')
+      .replace(/\d{1,2}(?::\d{2})?\s*(?:a|al)\s*\d{1,2}(?::\d{2})?/i, '')  // ES "12:00 a 20:00"
+      .replace(/\d{1,2}(?::\d{2})?\s*[–\-]\s*\d{1,2}(?::\d{2})?/, '');
+    // Clean up separators/whitespace left behind.
+    const desc = stripped.replace(/^[\s\-–—:]+|[\s\-–—:]+$/g, '').trim();
+    return desc.length > 0 ? desc : undefined;
+  }
+
+  /**
+   * Normalize a time string (possibly without minutes) to HH:mm format.
+   */
+  private normalize24hTime(timeStr: string): string {
+    if (timeStr.includes(':')) {
+      const parts = timeStr.split(':');
+      return `${parts[0].padStart(2, '0')}:${parts[1]}`;
+    }
+    return `${timeStr.padStart(2, '0')}:00`;
+  }
+
+}
+
+// ============================================================================
+// Park Subclasses
+// ============================================================================
+
+/**
+ * Movie Park Germany - Bottrop, Germany
+ */
+@destinationController({category: ['Parcs Reunidos', 'Movie Park Germany']})
+export class MovieParkGermany extends ParcsReunidosDestination {
+  constructor(options?: DestinationConstructor) {
+    super(options);
+    this.timezone = 'Europe/Berlin';
+    this.addConfigPrefix('MOVIEPARKGERMANY');
+  }
+}
+
+/**
+ * Bobbejaanland - Lichtaart, Belgium
+ */
+@destinationController({category: ['Parcs Reunidos', 'Bobbejaanland']})
+export class Bobbejaanland extends ParcsReunidosDestination {
+  constructor(options?: DestinationConstructor) {
+    super(options);
+    this.timezone = 'Europe/Brussels';
+    this.addConfigPrefix('BOBBEJAANLAND');
+  }
+}
+
+/**
+ * Maps Mirabilandia's own wait-time feed keys to Stay-App attraction IDs
+ * (which are the entity IDs this destination publishes).
+ *
+ * The two systems are unrelated, so this table is the join between them. It was
+ * built by matching the feed's per-area display names against the Stay-App
+ * `translatableName` values; 32 of the 33 non-seasonal keys matched 1:1.
+ *
+ * Deliberate non-1:1 entries:
+ *  - `oil_tower` — the feed publishes ONE queue for what Stay-App models as two
+ *    entities (Oil Tower 1 + 2). The towers share a single queue line, so the
+ *    same wait applies to both.
+ *
+ * Keys intentionally absent:
+ *  - The Halloween Horror Festival mazes (llorona, acid_rain, hypnotic_circus,
+ *    apartment, camera_meraviglie, mini_zombie, paranormal) exist only in the
+ *    feed — Stay-App has no entity for them, so there is nothing to attach live
+ *    data to. They sit behind `halloween_open` and are `closed: 1` off-season.
+ *
+ * Stay-App entities with no feed key (Dino Games, Motion Sphere, Splish Splat,
+ * Giochi a premio, PAW Patrol Adventure Bay, Campo Sioux, Fort Alamo) are play
+ * areas and arcades with no queue, and correctly receive no live data.
+ */
+const MIRABILANDIA_WAIT_TIME_ENTITY_IDS: Record<string, readonly string[]> = {
+  aquila: ['126252'],
+  autosplash: ['126257'],
+  balloons: ['584653'],
+  bicisauro: ['126032'],
+  bikini: ['584644'],
+  blu_river: ['126248'],
+  buffalo_bill: ['126251'],
+  carousel: ['584646'],
+  cowabunga: ['584642'],
+  desmo_race: ['126292'],
+  diavel_ring: ['125994'],
+  divertical: ['126291'],
+  dora_train: ['584655'],
+  el_dorado_falls: ['126250'],
+  eurowheel: ['126026'],
+  gold_digger: ['126254'],
+  i_speed: ['126284'],
+  jellyfish: ['584645'],
+  katun: ['126283'],
+  kiddy_monster: ['125992'],
+  master_thai: ['126249'],
+  monosauro: ['126001'],
+  oil_tower: ['126289', '126287'],
+  patrol: ['584650'],
+  raptotana: ['126150'],
+  raratonga: ['126255'],
+  reptilium: ['125997'],
+  reset: ['126256'],
+  rexplorer: ['126149'],
+  rio_bravo: ['126253'],
+  rubble: ['584648'],
+  simulatori: ['126282'],
+  torri_geronimo: ['126047'],
+  twd: ['303683'],
+};
+
+/**
+ * Classify a feed note into a live status.
+ *
+ * Notes replace `wait_time` entirely, so their only job is to distinguish a
+ * ride that is out of service from one that simply hasn't opened yet. The park
+ * writes three shapes, seen live: a delayed opening ("dalle 11.30" /
+ * "opening at 11.30", punctuation varies between `.` and `:`), an explicit
+ * "Attualmente chiuso" / "Currently closed", and "Non disponibile" /
+ * "Not available".
+ *
+ * Only the last maps to DOWN — it is the park's own wording for a ride that
+ * should be running and isn't. A delayed opening is a ride that is scheduled to
+ * open later today, which is CLOSED, not broken. Anything unrecognised falls
+ * back to CLOSED rather than DOWN: an unknown note is not evidence of a
+ * breakdown, and inventing one would be worse than reporting a closure.
+ */
+function classifyMirabilandiaNote(note: string): 'CLOSED' | 'DOWN' {
+  return /\b(non disponibile|not available)\b/i.test(note) ? 'DOWN' : 'CLOSED';
+}
+
+/**
+ * Mirabilandia - Ravenna, Italy
+ *
+ * Wait times do NOT come from Stay-App. Mirabilandia's Stay-App establishment
+ * publishes no `waitingTime` field at all — confirmed over a full operating day
+ * against a sibling park on the same credential — so the inherited
+ * `buildLiveData()` emits nothing for this park.
+ *
+ * The park runs its own wait-time microsite instead, which the official app
+ * opens in a webview via Stay-App's generic `WAITING_TIME_BUTTON_LINK`
+ * establishment string. This class overrides `buildLiveData()` to read that
+ * feed and join it back onto the Stay-App entity IDs.
+ */
+@destinationController({category: ['Parcs Reunidos', 'Mirabilandia']})
+export class Mirabilandia extends ParcsReunidosDestination {
+  /**
+   * Base URL of the park's wait-time microsite (the directory containing
+   * `attrazioni.json` and `info.json`). No live data is emitted when unset.
+   */
+  @config
+  waitTimesUrl: string = '';
+
+  constructor(options?: DestinationConstructor) {
+    super(options);
+    this.timezone = 'Europe/Rome';
+    this.addConfigPrefix('MIRABILANDIA');
+  }
+
+  /**
+   * Fetch the park's per-attraction wait-time feed.
+   *
+   * Cached 30s, matching the microsite's own `REFRESH_INTERVAL`. The feed
+   * itself regenerates roughly every 60s (measured), so this over-polls
+   * about 2x — deliberately: aligning to 60s risks landing just before a
+   * regeneration and carrying an almost-120s-old wait time.
+   *
+   * The origin sends no `Cache-Control` and sits behind no CDN, so unlike the
+   * app — which appends a `?_=<epoch>` cache-buster to defeat webview
+   * caching — the bare URL is safe here. Verified: bare and cache-busted
+   * requests return identical `timestamp` values across successive polls.
+   */
+  @http({cacheSeconds: 30})
+  async fetchWaitTimes(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.waitTimesUrl.replace(/\/+$/, '')}/attrazioni.json`,
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Fetch the microsite's park-level open/closed flag.
+   *
+   * Separate from the attraction feed because the park publishes it separately
+   * and it gates the whole response: when `isopen` is false the microsite hides
+   * every wait time regardless of what `attrazioni.json` still contains.
+   */
+  @http({cacheSeconds: 30})
+  async fetchWaitTimesInfo(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.waitTimesUrl.replace(/\/+$/, '')}/info.json`,
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  protected async buildLiveData(): Promise<LiveData[]> {
+    // Without the feed there is no wait-time source at all for this park —
+    // Stay-App carries none — so emit nothing rather than a page of guesses.
+    if (!this.waitTimesUrl) return [];
+
+    let info: CodeattrInfo;
+    let attractions: Record<string, CodeattrAttraction>;
+    try {
+      const [infoResp, waitResp] = await Promise.all([
+        this.fetchWaitTimesInfo(),
+        this.fetchWaitTimes(),
+      ]);
+      info = (await infoResp.json()) as CodeattrInfo;
+      const payload = (await waitResp.json()) as CodeattrAttractionsResponse;
+      attractions = payload?.attrazioni ?? {};
+    } catch (err: any) {
+      // Emitting nothing lets the previous values age out honestly. Emitting a
+      // fabricated status here would overwrite good data from a healthy poll.
+      console.warn(`[${this.constructor.name}] wait-time feed unavailable: ${err?.message ?? err}`);
+      return [];
+    }
+
+    const liveData: LiveData[] = [];
+    const push = (entityIds: readonly string[], build: (id: string) => LiveData) => {
+      for (const id of entityIds) liveData.push(build(id));
+    };
+
+    for (const [key, entityIds] of Object.entries(MIRABILANDIA_WAIT_TIME_ENTITY_IDS)) {
+      const item = attractions[key];
+      if (!item) continue;
+
+      // The park is shut: every ride it lists is closed, which is a current
+      // observation and not a stale one, so say so rather than going quiet and
+      // letting the entities rot on the dashboard.
+      if (info?.isopen === false) {
+        push(entityIds, (id) => ({id, status: 'CLOSED'}) as LiveData);
+        continue;
+      }
+
+      // `closed: 1` removes the attraction from the microsite's UI entirely —
+      // it is not part of today's line-up (off-season mazes, rides not opening
+      // at all today). Still CLOSED rather than skipped: we know its current
+      // state, and skipping would strand its last live value.
+      if (item.closed === 1) {
+        push(entityIds, (id) => ({id, status: 'CLOSED'}) as LiveData);
+        continue;
+      }
+
+      // A note replaces the wait time; check it before `wait_time` so a ride
+      // that is out of service is never reported as a zero-minute walk-on.
+      const note = item.note_en || item.note_it;
+      if (note && note.trim()) {
+        const status = classifyMirabilandiaNote(note);
+        push(entityIds, (id) => ({id, status}) as LiveData);
+        continue;
+      }
+
+      // Guard the numeric conversion: `wait_time` is unvalidated JSON, and
+      // Number.isFinite does not coerce, so a numeric string would otherwise
+      // fall through as a non-finite value. `''`/null must not become 0 —
+      // Number('') is 0, hence the explicit nullish/empty check first.
+      if (item.wait_time === undefined || item.wait_time === null || (item.wait_time as unknown) === '') {
+        continue;
+      }
+      const waitTime = Number(item.wait_time);
+      if (!Number.isFinite(waitTime) || waitTime < 0) continue;
+
+      push(entityIds, (id) => ({
+        id,
+        status: 'OPERATING',
+        queue: {STANDBY: {waitTime}},
+      }) as LiveData);
+    }
+
+    return liveData;
+  }
+}
+
+/**
+ * Parque de Atracciones Madrid - Madrid, Spain
+ */
+@destinationController({category: ['Parcs Reunidos', 'Parque de Atracciones Madrid']})
+export class ParqueDeAtraccionesMadrid extends ParcsReunidosDestination {
+  constructor(options?: DestinationConstructor) {
+    super(options);
+    this.timezone = 'Europe/Madrid';
+    this.addConfigPrefix('PARQUEDEATRACCIONESMADRID');
+  }
+}
+
+/**
+ * Parque Warner Madrid - Madrid, Spain
+ */
+@destinationController({category: ['Parcs Reunidos', 'Parque Warner Madrid']})
+export class ParqueWarnerMadrid extends ParcsReunidosDestination {
+  constructor(options?: DestinationConstructor) {
+    super(options);
+    this.timezone = 'Europe/Madrid';
+    this.addConfigPrefix('PARQUEWARNERMADRID');
+  }
+}
+
+export {ParcsReunidosDestination};

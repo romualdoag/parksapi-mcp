@@ -1,0 +1,34 @@
+name: API Docs
+
+on:
+  push:
+    branches: [main]
+
+# Serialize gh-pages pushes. Without this, multiple merges in quick
+# succession race on `git push origin gh-pages` and one run fails with
+# `! [rejected] (fetch first)`. Letting in-flight runs finish (rather
+# than cancelling them) means the newest commit's docs always end up
+# published.
+concurrency:
+  group: api-docs
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24.x
+    - run: npm ci
+    - run: npm run docs
+
+    - name: Deploy to GitHub Pages
+      uses: peaceiris/actions-gh-pages@v4
+      with:
+        deploy_key: ${{ secrets.ACTIONS_DEPLOY_KEY }}
+        publish_dir: ./docs

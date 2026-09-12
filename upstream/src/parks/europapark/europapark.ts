@@ -1,0 +1,1188 @@
+import {Destination, DestinationConstructor} from '../../destination.js';
+import {cache} from '../../cache.js';
+import {http, HTTPObj} from '../../http.js';
+import {inject} from '../../injector.js';
+import {reusable} from '../../promiseReuse.js';
+import config from '../../config.js';
+import {destinationController} from '../../destinationRegistry.js';
+import {
+  Entity,
+  LiveData,
+  EntitySchedule,
+  AttractionTypeEnum,
+} from '@themeparks/typelib';
+import {formatInTimezone, addDays, isBefore, addMinutes, constructDateTime} from '../../datetime.js';
+import {TagBuilder} from '../../tags/index.js';
+
+// ─── Data types ──────────────────────────────────────────────────────────────
+
+/** A single POI from the Europa-Park /api/v2/pois endpoint */
+type EuropaParkPOI = {
+  id: number;
+  name: string;
+  // Internal label; sometimes the only place a not-yet-published show's title
+  // lives while its public `name` is still empty (e.g. Rulantica show 133).
+  analyticsName?: string;
+  type: string;
+  subtype?: string;
+  queueing?: boolean;
+  scopes?: string[];
+  latitude?: number;
+  longitude?: number;
+  minHeight?: number;
+  maxHeight?: number;
+  code?: number;
+  // showlocation sub-entities
+  shows?: EuropaParkShow[];
+  // virtual-queue companion data (injected during entity build)
+  vQueue?: EuropaParkPOI;
+};
+
+/** A show entry nested inside a showlocation POI */
+type EuropaParkShow = {
+  id: number;
+  name: string;
+  analyticsName?: string;
+  duration?: number;
+  code?: number;
+  latitude?: number;
+  longitude?: number;
+};
+
+/** Waiting-times API response item */
+type EuropaParkWaitTime = {
+  code: number;
+  time: number;
+  startAt?: string | null;
+  endAt?: string | null;
+};
+
+/** Show-times API response item */
+type EuropaParkShowTime = {
+  showId: number;
+  today: string[];
+};
+
+/**
+ * EP-Express shuttle wait-time entry (hotelapp feed). One row per
+ * (station, vehicle) pair, present only for the trains currently circulating.
+ * `waitingMinutes` is the ETA of that train to that station.
+ */
+type EuropaParkExpressWait = {
+  station: number;
+  vehicle: number;
+  waitingMinutes: number;
+};
+
+/** Season schedule item */
+type EuropaParkSeason = {
+  startAt: string;
+  endAt: string;
+  startAt_time?: string; // opening time component from the API
+  endAt_time?: string;   // closing time component from the API
+  scopes: string[];
+  status: string;
+  closed?: boolean;
+  specialOpenTimes?: Array<{
+    dateAt: string;
+    startAt: string | null;
+    endAt: string | null;
+  }>;
+  hotelStartAt?: string;
+  hotelEndAt?: string;
+};
+
+/** Live calendar overlay for today */
+type EuropaParkLiveCalendar = {
+  today?: {
+    date: string;
+    start: string | null;
+    end: string | null;
+  };
+};
+
+// ─── Internal entity record (mirrors europaparkdb _getEntities output) ────────
+
+type EuropaParkEntity = {
+  id: string;
+  name: string;
+  entityType: 'ATTRACTION' | 'SHOW';
+  scopes: string[];
+  code?: number;
+  vQueue?: EuropaParkPOI;
+  duration?: number;
+  latitude?: number;
+  longitude?: number;
+  minHeight?: number;
+  maxHeight?: number;
+};
+
+// ─── Park config ──────────────────────────────────────────────────────────────
+
+type EuropaParkConfig = {
+  id: number;
+  scope: string;
+  name?: string;         // optional name override (e.g. Traumatica)
+  poiType?: string;      // override for park-type lookup (e.g. eventlocation)
+};
+
+const PARK_CONFIGS: EuropaParkConfig[] = [
+  {id: 493, scope: 'europapark'},
+  {id: 494, scope: 'rulantica'},
+  {id: 642, scope: 'traumatica', name: 'Traumatica', poiType: 'eventlocation'},
+];
+
+const DESTINATION_ID = 'europapark';
+const TIMEZONE = 'Europe/Berlin';
+
+// ─── EP-Express shuttle ────────────────────────────────────────────────────────
+//
+// The EP-Express is the shuttle train that loops between the resort hotels and
+// the park (one-way: Alexanderplatz → Hotels → Spain → Greece → …). Its
+// four stations exist in the regular POI catalogue as `attraction` POIs (so the
+// entity builder already emits them as `pois_<id>` under Europa-Park), but they
+// carry no entry in the regular waiting-times feed — their only live source is a
+// separate public hotelapp feed (`/nu/?content_id=751`), which reports an ETA
+// per (station, vehicle). Station numbering in that feed differs from the POI id,
+// hence the explicit map below. (A companion live-GPS feed, content_id 648, is
+// used only for offline verification and is not consumed at runtime.)
+const EP_EXPRESS_WAITTIMES_CONTENT_ID = 751;
+
+/** hotelapp feed `station` id → Europa-Park POI numeric id. */
+const EP_EXPRESS_STATION_TO_POI: Record<number, number> = {
+  1: 60,  // Alexanderplatz
+  2: 62,  // Spain
+  3: 61,  // Greece
+  4: 395, // Hotels
+};
+
+/** Entity ids (`pois_<id>`) of the four EP-Express stations. */
+const EP_EXPRESS_ENTITY_IDS = new Set(
+  Object.values(EP_EXPRESS_STATION_TO_POI).map((poiId) => `pois_${poiId}`),
+);
+
+// ─── Main class ───────────────────────────────────────────────────────────────
+
+@config
+class EuropaParkBase extends Destination {
+  @config
+  apiBase: string = '';
+
+  @config
+  authURL: string = '';
+
+  @config
+  clientId: string = '';
+
+  @config
+  clientSecret: string = '';
+
+  @config
+  appVersion: string = '16.0.0';
+
+  /** Base URL of the public hotelapp host that serves the EP-Express feeds. */
+  @config
+  hotelAppBase: string = '';
+
+  timezone: string = TIMEZONE;
+
+  constructor(options?: DestinationConstructor) {
+    super(options);
+    this.addConfigPrefix('EUROPAPARK');
+  }
+
+  // ─── Authentication ──────────────────────────────────────────────────────
+
+  /** Inject Bearer token + User-Agent into all API requests */
+  @inject({
+    eventName: 'httpRequest',
+    hostname: function(this: EuropaPark) {
+      return new URL(this.apiBase).hostname;
+    },
+    tags: {$nin: ['auth']},
+  })
+  async injectAuth(req: HTTPObj): Promise<void> {
+    const {token} = await this.getToken();
+    req.headers = {
+      ...req.headers,
+      'authorization': `Bearer ${token}`,
+      'accept-language': 'en',
+      'user-agent': `EuropaParkApp/${this.appVersion} (Android)`,
+    };
+  }
+
+  /** Inject User-Agent on auth endpoint too */
+  @inject({
+    eventName: 'httpRequest',
+    hostname: function(this: EuropaPark) {
+      return new URL(this.authURL).hostname;
+    },
+    tags: {$in: ['auth']},
+  })
+  async injectAuthUA(req: HTTPObj): Promise<void> {
+    req.headers = {
+      ...req.headers,
+      'user-agent': `EuropaParkApp/${this.appVersion} (Android)`,
+    };
+  }
+
+  /** Clear cached token on 401 */
+  @inject({
+    eventName: 'httpError',
+    hostname: function(this: EuropaPark) {
+      return new URL(this.apiBase).hostname;
+    },
+  })
+  async handleUnauthorized(req: HTTPObj): Promise<void> {
+    if (req.response?.status === 401) {
+      const {CacheLib} = await import('../../cache.js');
+      await CacheLib.delete(`${this.constructor.name}:getToken:[]`);
+    }
+  }
+
+  /** Fetch OAuth2 token (form-encoded POST, like needle default) */
+  @http({tags: ['auth']} as any)
+  async fetchToken(): Promise<HTTPObj> {
+    const params = new URLSearchParams({
+      client_id: this.clientId,
+      client_secret: this.clientSecret,
+      grant_type: 'client_credentials',
+    });
+
+    return {
+      method: 'POST',
+      url: this.authURL,
+      body: params.toString(),
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      tags: ['auth'],
+    } as any as HTTPObj;
+  }
+
+  /** Cached OAuth2 token – expires according to API-supplied expires_in */
+  @cache({callback: (resp: {token: string; expiresIn: number}) => resp?.expiresIn || 86400})
+  async getToken(): Promise<{token: string; expiresIn: number}> {
+    const resp = await this.fetchToken();
+    const data: any = await resp.json();
+    if (!data?.access_token) {
+      throw new Error(`Europa-Park: failed to obtain access_token`);
+    }
+    return {
+      token: data.access_token,
+      expiresIn: (data.expires_in as number) || 86400,
+    };
+  }
+
+  // ─── API fetch methods ────────────────────────────────────────────────────
+
+  /**
+   * Fetch ALL POI data. The endpoint is /api/v2/poi-group (was /api/v2/pois),
+   * returns {pois: [...]}. Response is multi-MB — server sends Cache-Control
+   * max-age=60 s-maxage=120; we cache 12h because the POI catalogue is quasi-
+   * static and we don't need per-minute freshness.
+   */
+  @http({cacheSeconds: 60 * 60 * 12} as any)
+  async fetchPOIs(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/api/v2/poi-group?status[]=live`,
+      options: {json: true},
+      tags: [],
+    } as any as HTTPObj;
+  }
+
+  /** Waiting-times endpoint – cache 1 minute */
+  @http({cacheSeconds: 60} as any)
+  async fetchWaitingTimes(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/api/v2/waiting-times`,
+      options: {json: true},
+      tags: [],
+    } as any as HTTPObj;
+  }
+
+  /** Season schedule endpoint – cache 6 hours */
+  @http({cacheSeconds: 60 * 60 * 6} as any)
+  async fetchSeasons(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/api/v2/seasons?status[]=live`,
+      options: {json: true},
+      tags: [],
+    } as any as HTTPObj;
+  }
+
+  /** Live calendar overlay for today (europapark scope only) – cache 5 minutes */
+  @http({cacheSeconds: 60 * 5} as any)
+  async fetchLiveCalendar(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/api/v2/season-opentime-details/europapark`,
+      options: {json: true},
+      tags: [],
+    } as any as HTTPObj;
+  }
+
+  /** Show-times for today – cache 6 hours */
+  @http({cacheSeconds: 60 * 60 * 6} as any)
+  async fetchShowTimes(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/api/v2/show-times?status[]=live`,
+      options: {json: true},
+      tags: [],
+    } as any as HTTPObj;
+  }
+
+  /**
+   * EP-Express shuttle wait times, sourced from the public backend of the
+   * Europa-Park Hotels app. Public GET on the hotelapp host — no auth or app
+   * headers required (the Bearer injector is scoped to the apiBase host and
+   * never touches this domain). The upstream refreshes only every ~3 minutes, so
+   * a 60 s cache is a comfortable floor.
+   */
+  @http({cacheSeconds: 60} as any)
+  async fetchExpressWaitTimes(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.hotelAppBase}/nu/?content_id=${EP_EXPRESS_WAITTIMES_CONTENT_ID}`,
+      options: {json: true},
+      tags: [],
+    } as any as HTTPObj;
+  }
+
+  // ─── Parsed data getters ──────────────────────────────────────────────────
+  //
+  // The @http decorator already caches the serialised response; a second
+  // @cache layer here would re-serialise the parsed array (multi-MB for POIs)
+  // into SQLite on every hit, which dominated buildLiveData latency. @reusable
+  // coalesces concurrent in-flight calls without persisting anything.
+
+  @reusable()
+  async getPOIs(): Promise<EuropaParkPOI[]> {
+    const resp = await this.fetchPOIs();
+    const data: any = await resp.json();
+    // New endpoint returns {pois: [...]}; older endpoint returned a bare array.
+    const list = Array.isArray(data) ? data : data?.pois;
+    if (!Array.isArray(list)) {
+      throw new Error(`Europa-Park: unexpected POI response (type: ${typeof data})`);
+    }
+    return list as EuropaParkPOI[];
+  }
+
+  // Return the raw array unparsed — upstream occasionally injects non-object
+  // poison entries (a PHP cURL error string as the first element when the
+  // internal /waittimes/ proxy fails), so callers must narrow to
+  // `EuropaParkWaitTime` via runtime validation.
+  @reusable()
+  async getWaitingTimes(): Promise<unknown[]> {
+    const resp = await this.fetchWaitingTimes();
+    const data = await resp.json();
+    return Array.isArray(data) ? data : [];
+  }
+
+  @reusable()
+  async getSeasons(): Promise<EuropaParkSeason[]> {
+    const resp = await this.fetchSeasons();
+    return (await resp.json()) as EuropaParkSeason[];
+  }
+
+  @reusable()
+  async getLiveCalendar(): Promise<EuropaParkLiveCalendar> {
+    const resp = await this.fetchLiveCalendar();
+    return (await resp.json()) as EuropaParkLiveCalendar;
+  }
+
+  @reusable()
+  async getShowTimes(): Promise<EuropaParkShowTime[]> {
+    const resp = await this.fetchShowTimes();
+    return (await resp.json()) as EuropaParkShowTime[];
+  }
+
+  /**
+   * Parse the EP-Express feed into a flat list of wait entries. The feed is an
+   * object keyed by numeric strings plus a trailing `success` flag, e.g.
+   * `{"0": {station, vehicle, waitingMinutes, updated_at}, …, "success": true}`,
+   * so we keep only the numerically-keyed object values.
+   */
+  @reusable()
+  async getExpressWaitTimes(): Promise<EuropaParkExpressWait[]> {
+    const resp = await this.fetchExpressWaitTimes();
+    const data: any = await resp.json();
+    if (!data || typeof data !== 'object') return [];
+    return Object.entries(data)
+      .filter(([key]) => /^\d+$/.test(key))
+      .map(([, value]) => value as EuropaParkExpressWait)
+      .filter(
+        (v): v is EuropaParkExpressWait =>
+          !!v && typeof v === 'object' && typeof v.station === 'number',
+      );
+  }
+
+  // ─── Entity builder helpers ───────────────────────────────────────────────
+
+  /**
+   * Convert raw POI list into the internal entity format used by both
+   * buildEntityList and buildLiveData. Mirrors the legacy _getEntities()
+   * logic from europaparkdb.js exactly.
+   */
+  @reusable()
+  async getParkEntities(): Promise<EuropaParkEntity[]> {
+    const poiData = await this.getPOIs();
+    const entities: EuropaParkEntity[] = [];
+
+    const addPoiData = (poi: EuropaParkPOI & {entityType?: string}): void => {
+      // Some shows (e.g. Rulantica 133 "TALENT ACADEMY on Stage") publish an
+      // empty public `name` with the title only in `analyticsName`. Fall back
+      // to it so the entity still surfaces; skip only when both are empty.
+      const name = poi.name || poi.analyticsName;
+      if (!name) return;
+
+      const poiEntityTypes = ['attraction', 'showlocation', 'shows', 'pois'];
+      const entityType = poi.entityType ?? poi.type;
+
+      if (!poiEntityTypes.includes(entityType)) return;
+
+      // showlocation → recurse into sub-shows
+      if (entityType === 'showlocation') {
+        (poi.shows || []).forEach((show) => {
+          addPoiData({
+            ...show,
+            entityType: 'shows',
+            latitude: poi.latitude,
+            longitude: poi.longitude,
+            scopes: poi.scopes,
+            type: 'shows',
+          } as any);
+        });
+        return;
+      }
+
+      // Only allow attraction subtype for 'pois' type
+      if (entityType === 'pois' && poi.type !== 'attraction') return;
+
+      // Skip virtual-queue dummy entries
+      if (poi.queueing) return;
+
+      // Skip queue map pointers
+      if (name.indexOf('Queue - ') === 0) return;
+
+      // Map old vs new entity type strings to id prefix
+      let idPrefix: string;
+      if (entityType === 'attraction') {
+        idPrefix = 'pois';
+      } else if (entityType === 'showlocation' || entityType === 'shows') {
+        idPrefix = 'shows';
+      } else {
+        idPrefix = entityType; // 'pois'
+      }
+
+      const finalEntityType: 'ATTRACTION' | 'SHOW' =
+        (entityType === 'shows' || entityType === 'showlocation') ? 'SHOW' : 'ATTRACTION';
+
+      // Look for a virtual-queue companion (queueing:true, name contains this ride's name)
+      const nameLower = name.toLowerCase();
+      const vQueueData = poiData.find((x) => {
+        return x.queueing === true && x.name.toLowerCase().indexOf(nameLower) > 0;
+      });
+
+      entities.push({
+        id: `${idPrefix}_${poi.id}`,
+        name,
+        entityType: finalEntityType,
+        scopes: poi.scopes || [],
+        code: poi.code,
+        vQueue: vQueueData,
+        duration: (poi as any).duration,
+        latitude: poi.latitude,
+        longitude: poi.longitude,
+        minHeight: poi.minHeight,
+        maxHeight: poi.maxHeight,
+      });
+    };
+
+    poiData.forEach((poi) => {
+      addPoiData({...poi, entityType: poi.type});
+    });
+
+    return entities;
+  }
+
+  // ─── Template Method: buildEntityList ────────────────────────────────────
+
+  async getDestinations(): Promise<Entity[]> {
+    return [
+      {
+        id: DESTINATION_ID,
+        name: 'Europa-Park',
+        entityType: 'DESTINATION',
+        timezone: TIMEZONE,
+        location: {latitude: 48.2661, longitude: 7.7225},
+      } as Entity,
+    ];
+  }
+
+  @reusable()
+  protected async buildEntityList(): Promise<Entity[]> {
+    const result: Entity[] = [...(await this.getDestinations())];
+
+    const [poiData, entities] = await Promise.all([
+      this.getPOIs(),
+      this.getParkEntities(),
+    ]);
+
+    // ── Parks ──────────────────────────────────────────────────────────────
+    const allowedTypes = new Set(['park', ...PARK_CONFIGS.filter((p) => p.poiType).map((p) => p.poiType!)]);
+
+    for (const parkConfig of PARK_CONFIGS) {
+      const expectedType = parkConfig.poiType ?? 'park';
+      const park = poiData.find((x) => x.id === parkConfig.id && x.type === expectedType);
+      if (!park) continue;
+
+      const parkEntity: Entity = {
+        id: `park_${park.id}`,
+        name: parkConfig.name || park.name,
+        entityType: 'PARK',
+        parentId: DESTINATION_ID,
+        destinationId: DESTINATION_ID,
+        timezone: TIMEZONE,
+      } as Entity;
+
+      if (park.latitude && park.longitude) {
+        parkEntity.location = {latitude: park.latitude, longitude: park.longitude};
+      } else {
+        parkEntity.location = {latitude: 48.2661, longitude: 7.7225};
+      }
+
+      result.push(parkEntity);
+    }
+
+    // ── Attractions (non-show entities scoped to each park) ────────────────
+    for (const parkConfig of PARK_CONFIGS) {
+      const parkId = `park_${parkConfig.id}`;
+      const parkAttractions = entities.filter(
+        (e) => e.entityType === 'ATTRACTION' && e.scopes.includes(parkConfig.scope),
+      );
+
+      for (const entity of parkAttractions) {
+        // Skip "+ Pass entrance" entries
+        if (entity.name.indexOf('+ Pass entrance') > 0) continue;
+
+        const attraction: Entity = {
+          id: entity.id,
+          name: entity.name,
+          entityType: 'ATTRACTION',
+          parentId: parkId,
+          destinationId: DESTINATION_ID,
+          timezone: TIMEZONE,
+        } as Entity;
+
+        // EP-Express stations are shuttle stops, not rides.
+        if (EP_EXPRESS_ENTITY_IDS.has(entity.id)) {
+          attraction.attractionType = AttractionTypeEnum.TRANSPORT;
+        }
+
+        // Location
+        if (entity.latitude && entity.longitude) {
+          attraction.location = {latitude: entity.latitude, longitude: entity.longitude};
+        } else {
+          attraction.location = {latitude: 48.2661, longitude: 7.7225};
+        }
+
+        // Tags
+        const tags = [];
+        if (entity.minHeight) {
+          tags.push(TagBuilder.minimumHeight(entity.minHeight, 'cm'));
+        }
+        if (entity.maxHeight) {
+          tags.push(TagBuilder.maximumHeight(entity.maxHeight, 'cm'));
+        }
+        if (tags.length) attraction.tags = tags;
+
+        result.push(attraction);
+      }
+    }
+
+    // ── Shows (per park, then hotel scope) ────────────────────────────────
+    const collectedShowIds = new Set<string>();
+
+    for (const parkConfig of PARK_CONFIGS) {
+      const parkId = `park_${parkConfig.id}`;
+      const parkShows = entities.filter(
+        (e) => e.entityType === 'SHOW' && e.scopes.includes(parkConfig.scope),
+      );
+
+      for (const entity of parkShows) {
+        const show: Entity = {
+          id: entity.id,
+          name: entity.name,
+          entityType: 'SHOW',
+          parentId: parkId,
+          destinationId: DESTINATION_ID,
+          timezone: TIMEZONE,
+        } as Entity;
+
+        if (entity.latitude && entity.longitude) {
+          show.location = {latitude: entity.latitude, longitude: entity.longitude};
+        } else {
+          show.location = {latitude: 48.2661, longitude: 7.7225};
+        }
+
+        result.push(show);
+        collectedShowIds.add(entity.id);
+      }
+    }
+
+    // Hotel-scoped shows (not already collected via a park scope)
+    const hotelShows = entities.filter(
+      (e) => e.entityType === 'SHOW' && e.scopes.includes('hotel'),
+    );
+
+    for (const entity of hotelShows) {
+      if (collectedShowIds.has(entity.id)) continue;
+
+      const show: Entity = {
+        id: entity.id,
+        name: entity.name,
+        entityType: 'SHOW',
+        parentId: DESTINATION_ID,
+        destinationId: DESTINATION_ID,
+        timezone: TIMEZONE,
+      } as Entity;
+
+      if (entity.latitude && entity.longitude) {
+        show.location = {latitude: entity.latitude, longitude: entity.longitude};
+      } else {
+        show.location = {latitude: 48.2661, longitude: 7.7225};
+      }
+
+      result.push(show);
+    }
+
+    // ── Restaurants (gastronomy POIs per park) ─────────────────────────────
+    for (const parkConfig of PARK_CONFIGS) {
+      const parkId = `park_${parkConfig.id}`;
+      const restaurantPOIs = poiData.filter(
+        (x) => x.type === 'gastronomy' && (x.scopes || []).includes(parkConfig.scope),
+      );
+
+      for (const poi of restaurantPOIs) {
+        const restaurant: Entity = {
+          id: `gastronomy_${poi.id}`,
+          name: poi.name,
+          entityType: 'RESTAURANT',
+          parentId: parkId,
+          destinationId: DESTINATION_ID,
+          timezone: TIMEZONE,
+        } as Entity;
+
+        if (poi.latitude && poi.longitude) {
+          restaurant.location = {latitude: poi.latitude, longitude: poi.longitude};
+        } else {
+          restaurant.location = {latitude: 48.2661, longitude: 7.7225};
+        }
+
+        result.push(restaurant);
+      }
+    }
+
+    return result;
+  }
+
+  // ─── Template Method: buildLiveData ──────────────────────────────────────
+
+  @reusable()
+  protected async buildLiveData(): Promise<LiveData[]> {
+    // Parallelise — these are independent network calls.
+    const [entities, poiData, waitsRaw, showTimes, expressWaits] = await Promise.all([
+      this.getParkEntities(),
+      this.getPOIs(),
+      this.getWaitingTimes(),
+      this.getShowTimes(),
+      // EP-Express lives on a separate host; a hotelapp outage shouldn't take
+      // the rest of Europa-Park's live data down with it. On failure we skip
+      // shuttle emission entirely (the stations get no live data) rather than
+      // falsely reporting them closed. When the host isn't configured at all
+      // (deployments that haven't set the new env var), skip silently — no
+      // fetch, no warning.
+      this.hotelAppBase
+        ? this.getExpressWaitTimes().catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`Europa-Park EP-Express feed unavailable (${msg}); skipping shuttle live data`);
+          return null;
+        })
+        : Promise.resolve(null),
+    ]);
+
+    // Narrow the raw wait-times array. Upstream occasionally injects a literal
+    // PHP cURL error string as the first element when its internal /waittimes/
+    // proxy fails; downstream also uses strict-equality switches and `<= 91`
+    // comparisons that silently misbehave on non-numbers — so require both a
+    // finite numeric `code` and a finite numeric `time`.
+    let waits = waitsRaw.filter(
+      (w): w is EuropaParkWaitTime => {
+        if (!w || typeof w !== 'object') return false;
+        const code = (w as any).code;
+        const time = (w as any).time;
+        return typeof code === 'number' && Number.isFinite(code)
+            && typeof time === 'number' && Number.isFinite(time);
+      },
+    );
+
+    // Defensive: detect the upstream glitch first observed at 2026-04-20T20:11:59Z,
+    // which briefly returned wait entries for ~94% of the attraction catalogue
+    // (vs ~45% on a normal day). The fingerprint is purely "implausibly large
+    // fraction of attractions reporting", agnostic to time-value shape, so it
+    // also catches future glitches with different time signatures.
+    if (this._isWaitsGlitch(waits, entities)) {
+      console.warn(
+        `Europa-Park waits sanity-check: suspected upstream glitch, skipping ` +
+        `wait-time emission this tick`,
+      );
+      waits = [];
+    }
+
+    // Build code → entityId map from attraction/show entities
+    const codeToEntityId = new Map<number, string>();
+    for (const entity of entities) {
+      if (entity.code) {
+        codeToEntityId.set(entity.code, entity.id);
+      }
+    }
+    // Also add restaurant codes (gastronomy POIs are not in the entity DB)
+    for (const poi of poiData) {
+      if (poi.type === 'gastronomy' && poi.code) {
+        codeToEntityId.set(poi.code, `gastronomy_${poi.id}`);
+      }
+    }
+
+    const liveDataMap = new Map<string, LiveData>();
+    const getOrCreate = (id: string): LiveData => {
+      let entry = liveDataMap.get(id);
+      if (!entry) {
+        entry = {id, status: 'OPERATING'} as LiveData;
+        liveDataMap.set(id, entry);
+      }
+      return entry;
+    };
+
+    // ── First pass: extract virtual-queue data ─────────────────────────────
+    type VQueueEntry = {
+      entityId: string;
+      ignoreCode: number;
+      returnStart: string | null;
+      returnEnd: string | null;
+      state: 'AVAILABLE' | 'TEMP_FULL' | 'FINISHED';
+    };
+    const vQueueData: VQueueEntry[] = [];
+
+    for (const wait of waits) {
+      // Find a ride whose vQueue.code matches this wait entry's code
+      const realRide = entities.find((e) => e.vQueue?.code === wait.code);
+      if (!realRide) continue;
+
+      // This wait entry is the VQ dummy – determine state
+      let state: 'AVAILABLE' | 'TEMP_FULL' | 'FINISHED' = 'AVAILABLE';
+      if (wait.time === 666) {
+        state = 'TEMP_FULL';
+      } else if (wait.time === 777 || wait.time === 888) {
+        // 777 = Virtual Line ended; 888 = queueing stopped (no longer admitting
+        // guests). Both mean the Virtual Line no longer hands out return times.
+        state = 'FINISHED';
+      }
+
+      if (realRide.code) {
+        const entityId = codeToEntityId.get(realRide.code);
+        if (entityId) {
+          vQueueData.push({
+            entityId,
+            ignoreCode: wait.code,
+            returnStart: wait.startAt ?? null,
+            returnEnd: wait.endAt ?? null,
+            state,
+          });
+        }
+      }
+    }
+
+    // ── Second pass: process wait times ───────────────────────────────────
+    for (const wait of waits) {
+      // Skip VQ dummy entries
+      if (vQueueData.find((v) => v.ignoreCode === wait.code)) continue;
+
+      const entityId = codeToEntityId.get(wait.code);
+      if (!entityId) continue;
+
+      const live = getOrCreate(entityId);
+
+      // Map time codes to status
+      switch (wait.time) {
+        case 999:
+        case 444: // weather
+        case 555: // ice
+          live.status = 'DOWN';
+          break;
+        case 222:
+          live.status = 'REFURBISHMENT';
+          break;
+        case 333:
+          live.status = 'CLOSED';
+          break;
+      }
+
+      // Stand-by queue applies to rides/shows, not restaurants
+      if (!entityId.startsWith('gastronomy_')) {
+        if (!live.queue) live.queue = {} as any;
+        live.queue!.STANDBY = {
+          waitTime: wait.time <= 91 ? wait.time : undefined,
+        };
+
+        // Inject virtual-queue data if available
+        const vq = vQueueData.find((v) => v.entityId === entityId);
+        if (vq) {
+          live.queue!.RETURN_TIME = this.buildReturnTimeQueue(
+            vq.state,
+            vq.returnStart,
+            vq.returnEnd,
+          );
+        }
+      }
+    }
+
+    // ── Show times ────────────────────────────────────────────────────────
+    const now = new Date();
+
+    for (const showEntry of showTimes) {
+      const showEntityId = `shows_${showEntry.showId}`;
+      const showEntity = entities.find((e) => e.id === showEntityId);
+      if (!showEntity) continue;
+
+      const live = getOrCreate(showEntityId);
+
+      const showtimes = showEntry.today.map((startTimeStr) => {
+        const startTime = new Date(startTimeStr);
+        const endTime = addMinutes(startTime, showEntity.duration || 0);
+        return {
+          startTime: formatInTimezone(startTime, TIMEZONE, 'iso'),
+          endTime: formatInTimezone(endTime, TIMEZONE, 'iso'),
+          type: 'Performance' as const,
+        };
+      });
+
+      live.showtimes = showtimes;
+
+      if (showtimes.length === 0) {
+        live.status = 'CLOSED';
+      } else {
+        // If the last show has ended, mark as closed
+        const lastEndTime = showtimes.reduce((latest, s) => {
+          const t = new Date(s.endTime);
+          return t > latest ? t : latest;
+        }, new Date(showtimes[0].startTime));
+
+        if (isBefore(lastEndTime, now)) {
+          live.status = 'CLOSED';
+        }
+      }
+    }
+
+    // ── EP-Express shuttle ─────────────────────────────────────────────────
+    // The four station POIs are owned exclusively by this feed (they never
+    // appear in the regular waiting-times feed), so we set their live records
+    // directly rather than merging into anything from the passes above.
+    if (expressWaits) {
+      for (const ld of this._buildExpressLiveData(expressWaits)) {
+        liveDataMap.set(ld.id, ld);
+      }
+    }
+
+    return Array.from(liveDataMap.values());
+  }
+
+  /**
+   * Build live data for the four EP-Express stations from the hotelapp feed.
+   *
+   * The "wait time" for a station is the ETA of the nearest train, i.e. the
+   * minimum `waitingMinutes` across the trains currently serving it. In
+   * practice only two of the three trains circulate (the third sits parked on
+   * a siding and is simply absent from the feed), so we make no assumption
+   * about how many vehicles report.
+   *
+   * A station with at least one finite, non-negative ETA is OPERATING. A
+   * station with no ETA is CLOSED — this also covers after-hours behaviour:
+   * when no train circulates the feed omits the (station, vehicle) rows, so
+   * every station falls through to CLOSED. Called only when the feed fetch
+   * succeeded, so an empty result genuinely means "no trains running" rather
+   * than "feed unreachable".
+   */
+  protected _buildExpressLiveData(expressWaits: EuropaParkExpressWait[]): LiveData[] {
+    const etasByStation = new Map<number, number[]>();
+    for (const wait of expressWaits) {
+      const minutes = Number(wait.waitingMinutes);
+      if (!Number.isFinite(minutes) || minutes < 0) continue;
+      const list = etasByStation.get(wait.station);
+      if (list) list.push(minutes);
+      else etasByStation.set(wait.station, [minutes]);
+    }
+
+    const result: LiveData[] = [];
+    for (const [stationId, poiId] of Object.entries(EP_EXPRESS_STATION_TO_POI)) {
+      const etas = etasByStation.get(Number(stationId));
+      const ld: LiveData = {id: `pois_${poiId}`, status: 'CLOSED'} as LiveData;
+      if (etas && etas.length > 0) {
+        ld.status = 'OPERATING';
+        ld.queue = {STANDBY: {waitTime: Math.min(...etas)}};
+      }
+      result.push(ld);
+    }
+    return result;
+  }
+
+  // ─── Template Method: buildSchedules ─────────────────────────────────────
+
+  protected async buildSchedules(): Promise<EntitySchedule[]> {
+    const schedules: EntitySchedule[] = [];
+
+    for (const parkConfig of PARK_CONFIGS) {
+      const schedule = await this._buildScheduleForPark(parkConfig);
+      schedules.push(schedule);
+    }
+
+    return schedules;
+  }
+
+  /** Build the schedule for a single park config */
+  private async _buildScheduleForPark(parkConfig: EuropaParkConfig): Promise<EntitySchedule> {
+    const cal = await this.getSeasons();
+    const now = new Date();
+    const nowDate = formatInTimezone(now, TIMEZONE, 'date');
+    // Cap the emission horizon. Some seasons (e.g. Rulantica) run to 2099 as
+    // a "always open" placeholder. Without a cap the inner loop formats
+    // ~28,000 days per call and dominates the collector's CPU time.
+    const horizonDate = (() => {
+      const raw = formatInTimezone(addDays(now, 180), TIMEZONE, 'date');
+      const [mm, dd, yyyy] = raw.split('/');
+      return `${yyyy}-${mm}-${dd}`;
+    })();
+
+    // Filter to open seasons for this park
+    const parkSeasons = cal.filter(
+      (s) => !s.closed && s.scopes.includes(parkConfig.scope) && s.status === 'live',
+    );
+
+    type ScheduleEntry = {
+      date: string;
+      openingTime: string;
+      closingTime: string;
+      type: 'OPERATING' | 'EXTRA_HOURS';
+      description?: string;
+    };
+
+    const times: ScheduleEntry[] = [];
+
+    for (const season of parkSeasons) {
+      // Build a lookup of special overrides by date string
+      const specialByDate = new Map<string, NonNullable<EuropaParkSeason['specialOpenTimes']>[0]>();
+      for (const special of season.specialOpenTimes || []) {
+        specialByDate.set(special.dateAt.substring(0, 10), special);
+      }
+
+      // Iterate over every day in the season range
+      const seasonStart = new Date(season.startAt);
+
+      // Extract date-only YYYY-MM-DD strings for the season start/end
+      const seasonEndDate = season.endAt.substring(0, 10);
+
+      // Start from max(seasonStart, today) to skip past entries without walking
+      // year-by-year. Stop at min(seasonEnd, horizon).
+      const effectiveEnd = seasonEndDate < horizonDate ? seasonEndDate : horizonDate;
+      let current = seasonStart.getTime() < now.getTime() ? new Date(now) : seasonStart;
+      while (true) {
+        const dateStr = formatInTimezone(current, TIMEZONE, 'date');
+        // Convert MM/DD/YYYY -> YYYY-MM-DD
+        const [mm, dd, yyyy] = dateStr.split('/');
+        const isoDate = `${yyyy}-${mm}-${dd}`;
+
+        if (isoDate > effectiveEnd) break;
+
+        if (isoDate < nowDate) {
+          current = addDays(current, 1);
+          continue;
+        }
+
+        const special = specialByDate.get(isoDate);
+
+        // null startAt on a special means park is closed that day despite the season
+        if (special && special.startAt === null) {
+          current = addDays(current, 1);
+          continue;
+        }
+
+        let openingTime: string;
+        let closingTime: string;
+
+        if (special) {
+          openingTime = special.startAt!;
+          closingTime = special.endAt!;
+        } else {
+          // Combine date + time components from season object
+          // The API returns full datetime strings like "2024-04-01T09:00:00+00:00"
+          // We apply the date portion from the current iteration date
+          openingTime = this._applyDateToTime(season.startAt, isoDate);
+          closingTime = this._applyDateToTime(season.endAt, isoDate);
+        }
+
+        // A closing time at/before the opening (typically a 00:00 close on a
+        // past-midnight event day) belongs to the following calendar day.
+        // Covers both the special-day and the regular branch above.
+        closingTime = this._rollClosingPastMidnight(openingTime, closingTime);
+
+        times.push({date: isoDate, openingTime, closingTime, type: 'OPERATING'});
+
+        // Hotel extra hours
+        if (season.hotelStartAt && season.hotelEndAt) {
+          times.push({
+            date: isoDate,
+            openingTime: this._applyDateToTime(season.hotelStartAt, isoDate),
+            closingTime: this._applyDateToTime(season.hotelEndAt, isoDate),
+            type: 'EXTRA_HOURS',
+            description: 'Open To Hotel Guests',
+          });
+        }
+
+        current = addDays(current, 1);
+      }
+    }
+
+    // Overlay live opening times for Europa-Park main park only
+    if (parkConfig.scope === 'europapark') {
+      const liveData = await this.getLiveCalendar();
+      if (liveData?.today && liveData.today.date) {
+        const date = liveData.today.date.substring(0, 10);
+
+        if (liveData.today.start === null || liveData.today.end === null) {
+          // Park is closed today – remove all schedule entries for today
+          for (let i = times.length - 1; i >= 0; i--) {
+            if (times[i].date === date) times.splice(i, 1);
+          }
+        } else if (
+          typeof liveData.today.start === 'string' &&
+          typeof liveData.today.end === 'string'
+        ) {
+          // Replace operating hours with live data
+          const entry = times.find((t) => t.date === date && t.type === 'OPERATING');
+          if (entry) {
+            entry.openingTime = liveData.today.start;
+            // Live "today" overlay can also report a 00:00 close on past-midnight
+            // event days — apply the same next-day roll as the seasons branch.
+            entry.closingTime = this._rollClosingPastMidnight(
+              liveData.today.start,
+              liveData.today.end,
+            );
+          }
+        }
+      }
+    }
+
+    return {
+      id: `park_${parkConfig.id}`,
+      schedule: times,
+    } as EntitySchedule;
+  }
+
+  /**
+   * Returns true when waits is reporting an implausibly large fraction of the
+   * attraction catalogue. Normal Europa-Park days see roughly 45% of coded
+   * attractions in the waits response; the 2026-04-20 glitch jumped that to
+   * ~94%. Threshold of >85% sits comfortably in the gap.
+   *
+   * The denominator is derived from the already-built entity list rather than
+   * raw POI data: getParkEntities owns the skip rules (nameless, VQ dummies,
+   * "Queue - …" map pointers, etc.) and we want the detector to track those
+   * rules automatically instead of duplicating them.
+   */
+  protected _isWaitsGlitch(waits: EuropaParkWaitTime[], entities: EuropaParkEntity[]): boolean {
+    const attractionCodes = new Set<number>();
+    for (const e of entities) {
+      if (e.entityType !== 'ATTRACTION') continue;
+      // Mirror the Number.isFinite gate used for waits — a NaN/Infinity code
+      // (possible from malformed upstream JSON) would inflate the denominator
+      // without ever matching a wait.
+      if (typeof e.code === 'number' && Number.isFinite(e.code)) {
+        attractionCodes.add(e.code);
+      }
+    }
+    if (attractionCodes.size === 0) return false;
+
+    const waitCodes = new Set<number>(waits.map((w) => w.code));
+    let inWaitsCount = 0;
+    for (const code of attractionCodes) {
+      if (waitCodes.has(code)) inWaitsCount++;
+    }
+
+    return inWaitsCount / attractionCodes.size > 0.85;
+  }
+
+  /**
+   * Given a full datetime string like "2025-04-01T09:00:00+02:00" and a target
+   * date "2025-07-15", returns a new datetime string with the date replaced but
+   * the time/offset preserved – as a proper ISO-8601 string in the park timezone.
+   *
+   * This replicates moment's:
+   *   moment.tz(inDate, tz).set({ year, month, date }).format()
+   */
+  private _applyDateToTime(datetimeStr: string, targetDate: string): string {
+    // Extract time portion (HH:mm:ss) from the original string
+    const match = datetimeStr.match(/T(\d{2}:\d{2}(?::\d{2})?)/);
+    const timePart = match ? match[1] : '00:00:00';
+    return constructDateTime(targetDate, timePart, TIMEZONE);
+  }
+
+  /**
+   * Europa-Park reports a 00:00 closing time on the SAME calendar day for days
+   * that run past midnight (the "Sommernächte" summer-night events): the
+   * upstream seasons feed carries `endAt` at 00:00 of the opening day, which is
+   * *before* `startAt` and yields a negative operating window. A midnight close
+   * belongs to the END of the operating day, so when the resolved closing time
+   * is not strictly after the opening time we roll it onto the following
+   * calendar day. Invalid/unparseable inputs are returned unchanged so this is
+   * a safe no-op for the normal same-day case.
+   */
+  private _rollClosingPastMidnight(openingTime: string, closingTime: string): string {
+    // A special day may carry endAt === null (startAt set, endAt null) — the `!`
+    // at the call site is compile-time only, so closingTime can be null here.
+    // Pass non-string values through untouched (new Date(null) is epoch 0, which
+    // is finite, so the check below would not catch it and the substring would
+    // throw). This preserves the original behaviour of emitting a null close.
+    if (typeof openingTime !== 'string' || typeof closingTime !== 'string') {
+      return closingTime;
+    }
+    const close = new Date(closingTime).getTime();
+    const open = new Date(openingTime).getTime();
+    if (!Number.isFinite(close) || !Number.isFinite(open) || close > open) {
+      return closingTime;
+    }
+    // Re-stamp the closing wall-clock time on the day after its current date.
+    // Date-only arithmetic in UTC keeps a DST transition from shifting the day
+    // boundary; _applyDateToTime re-derives the correct offset for the new day.
+    const closingDate = new Date(`${closingTime.substring(0, 10)}T00:00:00Z`);
+    closingDate.setUTCDate(closingDate.getUTCDate() + 1);
+    // utc-date-ok: closingDate was anchored at T00:00:00Z from an existing
+    // date string, so this reads back the same calendar day plus one.
+    const nextDay = closingDate.toISOString().substring(0, 10);
+    return this._applyDateToTime(closingTime, nextDay);
+  }
+}
+
+// ─── Destination registration ─────────────────────────────────────────────────
+
+@destinationController({category: 'Europa-Park'})
+export class EuropaPark extends EuropaParkBase {
+  constructor(options?: DestinationConstructor) {
+    super(options);
+  }
+}
+
+export default EuropaPark;

@@ -1,0 +1,2602 @@
+import {Destination, DestinationConstructor} from '../../destination.js';
+import crypto from 'crypto';
+
+import {cache} from '../../cache.js';
+import {http, HTTPObj} from '../../http.js';
+import {inject} from '../../injector.js';
+import config from '../../config.js';
+import {destinationController} from '../../destinationRegistry.js';
+import {
+  Entity,
+  LiveData,
+  EntitySchedule,
+  QueueTypeEnum,
+} from '@themeparks/typelib';
+import {formatUTC, parseTimeInTimezone, formatInTimezone, formatDate, addDays, isBefore, constructDateTime, addMinutes, hostnameFromUrl, shiftDateString} from '../../datetime.js';
+import {TagBuilder} from '../../tags/index.js';
+import {randomPointInRadius} from '../../geo.js';
+
+
+/**
+ * Universal wait time API response
+ */
+type UniversalWaitTimeResponse = Array<{
+  name: string;
+  wait_time_attraction_id?: string;
+  has_single_rider?: boolean;
+  queues: Array<{
+    queue_type: string;
+    status: string;
+    display_wait_time?: number;
+    opens_at?: string;
+    alternate_ids: Array<{
+      system_name: string;
+      system_id: string;
+    }>;
+  }>;
+}>;
+
+/**
+ * Universal virtual queue API response
+ */
+type UniversalVirtualQueueState = {
+  Id: string;
+  IsEnabled: boolean;
+  QueueEntityId: string;
+  /** Sanitized place_id of the host attraction (matches the new entity scheme). */
+  PlaceId?: string;
+};
+
+type UniversalVirtualQueueDetails = {
+  AppointmentTimes: Array<{
+    StartTime: string;
+    EndTime: string;
+  }>;
+};
+
+// ─── /resort-areas/{resortKey}/places types ──────────────────────────────────
+
+/**
+ * Sanitize a UDX place_id for use as a wiki entity id.
+ * The wiki allows [\w.-]; the raw place_id is usually clean but defensively
+ * normalise anything else (colons, zero-width spaces, non-ASCII). Idempotent.
+ * Mirrors the helper in src/parks/usj/universalstudiosjapan.ts.
+ */
+export function sanitizeId(id: string): string {
+  return id.replace(/[^\w.-]/g, '_');
+}
+
+/** A single place record from /resort-areas/{resortKey}/places. */
+export type UniversalPlace = {
+  place_id: string;
+  name: string;
+  short_description?: string;
+  long_description?: string;
+  resort_area_code: string;   // 'uor' | 'ush'
+  venue_id?: string;          // e.g. 'uor.usf' — parent park / hotel
+  land_id?: string;           // sub-area within a park (unused for now)
+  is_routable?: boolean;
+  geometry?: {
+    locations?: Array<{
+      location_type: string;  // 'map' | …
+      lat_lng?: {lat: number; lng: number};
+    }>;
+  };
+  place_type: {
+    type: string;             // 'Ride' | 'Show' | 'Dining' | 'Park' | 'Shop' | 'Amenity' | …
+    categories?: string[];
+    attributes?: Array<{name: string; value?: string}>;
+  };
+};
+
+export type UniversalPlacesResponse = {
+  results: Array<{
+    place: UniversalPlace;
+    open_now?: boolean;
+  }>;
+};
+
+/** Place types we map to entities; everything else is silently dropped. */
+const PLACE_TYPE_TO_ENTITY: Record<string, Entity['entityType']> = {
+  Ride: 'ATTRACTION',
+  Show: 'SHOW',
+  Dining: 'RESTAURANT',
+};
+
+/**
+ * Map of new park place_id → legacy numeric VenueId used by the legacy
+ * schedule endpoint (/api/services/parks/{venueId}/schedule).
+ *
+ * The schedule endpoint hasn't been migrated to /places yet, so we still
+ * fetch it by numeric id and just relabel the resulting EntitySchedule
+ * with the new place_id.
+ *
+ * Doubles as the allow-list for which Park-type place records emit as
+ * PARK entities — the new feed marks CityWalk and Hollywood's Upper/Lower
+ * Lots as `Park`, but we don't surface those today (they aren't theme
+ * parks). Filter Park-type places against this table's keys in
+ * buildEntityList (Task 8).
+ *
+ * Confirmed via Task 1 probe: UOR has 5 Parks (cw + usf + ioa + eu + vb);
+ * USH has 4 Parks (cw + lower_lot + upper_lot + ush). Only the entries
+ * listed below are emitted.
+ */
+const PARK_PLACE_ID_TO_LEGACY_VENUE_ID: Record<string, string> = {
+  // UOR — `uor.cw` (CityWalk) intentionally excluded
+  'uor.usf': '10010',
+  'uor.ioa': '10000',
+  'uor.eu':  '24000',
+  'uor.vb':  '13801',
+  // USH — Lower/Upper Lot are sub-areas of `ush.ush`, not separate parks;
+  // CityWalk excluded for the same reason as UOR
+  'ush.ush': '13825',
+};
+
+/**
+ * Park-type places we deliberately do NOT surface as parks
+ * (PARK_PLACE_ID_TO_LEGACY_VENUE_ID omits them) still appear as the `venue_id`
+ * of real child places. Left alone, those children reference a parent entity
+ * that is never emitted, so the sync strands them in its unresolved-parent
+ * queue every cycle — never pushing them (observed on USH: 73 dining / rides /
+ * shows held indefinitely, incl. Fast & Furious: Hollywood Drift). Reconcile
+ * each such venue here, keyed by its sanitized venue_id:
+ *   - a park id → reparent the child onto that surfaced park
+ *   - null      → the venue has no wiki representation; drop the child
+ */
+const NON_SURFACED_VENUE_PARENT: Record<string, string | null> = {
+  // USH — Upper/Lower Lot are sub-areas of the single `ush.ush` park.
+  'ush.upper_lot': 'ush.ush',
+  'ush.lower_lot': 'ush.ush',
+  // CityWalk is a dining/shopping district, not a park on the wiki — exclude.
+  'ush.cw': null,
+  'uor.cw': null,
+};
+
+/**
+ * Resolve a show-list entry's `venue_id` to the schedule-bearing park
+ * place_id used as a key into PARK_PLACE_ID_TO_LEGACY_VENUE_ID (e.g.
+ * 'ush.upper_lot' -> 'ush.ush'), for clock-gating show status against park
+ * hours. Mirrors the reparenting placeToEntity applies to child entities.
+ * Returns null only for a missing venue_id, or a venue explicitly mapped to
+ * null in NON_SURFACED_VENUE_PARENT (CityWalk — no schedule to check
+ * against). Any other venue_id passes through sanitized as-is, whether or
+ * not it's actually a surfaced park; a value that isn't a real key in
+ * PARK_PLACE_ID_TO_LEGACY_VENUE_ID simply misses the lookup at the call
+ * site and falls back to "hours unknown", same end result as null.
+ */
+function resolveScheduleVenue(venueId: string | undefined): string | null {
+  if (!venueId) return null;
+  const venue = sanitizeId(venueId);
+  if (venue in NON_SURFACED_VENUE_PARENT) {
+    return NON_SURFACED_VENUE_PARENT[venue];
+  }
+  return venue;
+}
+
+/** Read a single attribute value from a place's place_type.attributes[]. */
+function attr(place: UniversalPlace, name: string): string | undefined {
+  return place.place_type.attributes?.find((a) => a.name === name)?.value;
+}
+
+/**
+ * True for event-flagged language / operational *variants* of another POI —
+ * e.g. USH's "Studio Tour - Mandarin/Spanish" and "Studio Tour Last Tram",
+ * which are alternate-language / last-departure duplicates of the canonical
+ * Studio Tour (their share links even point at WaterWorld). The feed marks each
+ * `is_event=true` AND aims its `social_sharing_link?id=` at a DIFFERENT place
+ * that ACTUALLY EXISTS in the feed (the canonical to defer to).
+ *
+ * Two things are NOT variants and must be kept:
+ *  - a share link that points at the place's own id (Bowser Jr. Challenge is
+ *    `is_event=true` but links to itself), and
+ *  - a share link that points at an id which does NOT exist in the feed — sloppy
+ *    feed data, not a real alias. UOR's Epic Universe meets (`uor.ueu.show.meet_
+ *    donkey_kong`) link to a phantom `uor.ueu.entertainment.meet_donkey_kong`
+ *    that the feed never emits; they are legit standalone entities.
+ *
+ * `knownPlaceIds` is the set of sanitized place_ids present in the feed.
+ */
+export function isEventVariantAlias(place: UniversalPlace, knownPlaceIds: Set<string>): boolean {
+  if (attr(place, 'is_event') !== 'true') return false;
+  const link = attr(place, 'social_sharing_link');
+  const match = typeof link === 'string' ? link.match(/[?&]id=([^&]+)/) : null;
+  if (!match) return false;
+  let sharedId: string;
+  try {
+    sharedId = decodeURIComponent(match[1]);
+  } catch {
+    sharedId = match[1];
+  }
+  const sharedSan = sanitizeId(sharedId);
+  // A real variant defers to a DIFFERENT canonical that exists. Same-id (self
+  // link) or a target absent from the feed → keep the entity.
+  return sharedSan !== sanitizeId(place.place_id) && knownPlaceIds.has(sharedSan);
+}
+
+/**
+ * A place name with every Unicode space folded to a plain one and the ends
+ * trimmed, for matching against.
+ *
+ * The feed mixes them: "MADLANDS: Caged Cannibals\u00a0Accessibility Return
+ * Time" carries a non-breaking space before "Accessibility" where its nine
+ * siblings use an ordinary one. It is invisible in logs and in a diff, and it
+ * silently defeated the suffix test for exactly one of the ten — the kind of
+ * near-miss that looks like a feed change rather than a bug. Normalise before
+ * matching, never match raw.
+ */
+function normalizeName(name: string | undefined): string {
+  return (name ?? '').replace(/\s/g, ' ').trim();
+}
+
+/**
+ * Place-id namespaces that are not points of interest at all.
+ *
+ * Real POIs are keyed under a park or venue (`uor.usf.…`, `ush.upper_lot.…`)
+ * or a resort-wide category (`ush.dining.…`). These two namespaces instead
+ * carry annual-passholder marketing copy, typed as though it were an
+ * attraction — "Save 30% on Select Universal Express Passes" arrives as a
+ * `Ride`, "Character Meet & Greets" as a Show, and the several "Exclusive
+ * Menu Items" entries as Dining. Publishing them puts adverts on the wiki as
+ * rides, so they are dropped by namespace rather than by guessing from copy.
+ *
+ * A deny-list, not a heuristic: everything else is kept. Hollywood uses
+ * neither namespace, and no other second segment overlaps them.
+ */
+const NON_POI_NAMESPACES = new Set(['pad', 'pan']);
+
+/** True for a passholder-marketing entry masquerading as a POI. */
+export function isNonPoiNamespace(place: UniversalPlace): boolean {
+  return NON_POI_NAMESPACES.has(place.place_id?.split('.')[1] ?? '');
+}
+
+/**
+ * True for an Orlando accessibility-return-time POI — the feed publishes each
+ * Halloween Horror Nights house's accessibility return service as its OWN
+ * `Ride` place ("Sinners Accessibility Return Time" beside "Sinners"), the
+ * same shape as Hollywood's express variants.
+ *
+ * All ten houses are already published, so left alone these would surface as
+ * ten duplicate rides named after a queue.
+ *
+ * Unlike the express variants the pairing here is EXACT — dropping the
+ * `_daap` suffix yields the canonical place_id — so the sibling is required
+ * to exist before the variant is discarded. A `_daap` place with no canonical
+ * is sloppy feed data rather than a duplicate, and is kept, matching how
+ * isEventVariantAlias treats a share link pointing at a phantom id.
+ *
+ * The return-time VALUE is deliberately not folded onto the house. Unlike the
+ * express wait, nothing observable carries it: across the wait-time feed, the
+ * virtual-queue feed and the place record itself, these ids produce no live
+ * data outside event hours, so the shape and meaning of the reading are
+ * unconfirmed. Attaching a number whose semantics are a guess is how a wrong
+ * return time reaches a guest who needs an accurate one. Publish the houses
+ * correctly first; fold the value once it can be observed during an event.
+ */
+export function isAccessibilityReturnTimeVariant(
+  place: UniversalPlace,
+  knownPlaceIds: Set<string>,
+): boolean {
+  if (place.place_type?.type !== 'Ride') return false;
+  if (attr(place, 'is_event') !== 'true') return false;
+  if (!/_daap$/.test(place.place_id ?? '')) return false;
+  if (!/ Accessibility Return Time$/.test(normalizeName(place.name))) return false;
+  return knownPlaceIds.has(sanitizeId(place.place_id.replace(/_daap$/, '')));
+}
+
+/**
+ * True for a Hollywood express-queue POI — the feed publishes the express
+ * line of an HHN maze as its OWN `Ride` place ("Hellraiser - Express"
+ * alongside "Hellraiser"), rather than as a queue on the maze.
+ *
+ * Left alone these surface as duplicate attractions whose express wait is
+ * published as a STANDBY number, so the site shows "Sinners - Express 45"
+ * next to a Sinners that is really 110. buildLiveData folds the value onto
+ * the maze as PAID_STANDBY instead (see buildExpressVariantMap).
+ *
+ * Matched on the `" - Express"` name suffix together with `is_event`, which
+ * is deliberately narrow. Both resorts carry places that must NOT match:
+ * Panda Express (Dining, and no " - " separator), Hogwarts Express and its
+ * two stations (real rides, is_event=false), and "Hogwarts™ Express - First
+ * /Last Train" (is_event=true operational variants, but the suffix is the
+ * train, not Express). Verified against the live feed for both resorts.
+ */
+export function isExpressQueueVariant(place: UniversalPlace): boolean {
+  return place.place_type?.type === 'Ride'
+    && attr(place, 'is_event') === 'true'
+    && / - Express$/.test(normalizeName(place.name));
+}
+
+/** Slug of a place_id with the separators and the season prefix removed. */
+function expressPairKey(placeId: string): string {
+  const leaf = placeId.split('.').pop() ?? placeId;
+  return leaf
+    .replace(/_express$/, '')
+    .replace(/^hhn_\d{4}_/, '')
+    .replace(/[^a-z0-9]/gi, '')
+    .toLowerCase();
+}
+
+/**
+ * Pair each express-queue POI to the maze it belongs to, keyed by sanitized
+ * place_id.
+ *
+ * The feed offers no link to pair on: these records carry no
+ * `social_sharing_link` (which is why isEventVariantAlias never caught them),
+ * no parent and no cross-reference, and two of the eight even sit in a
+ * different lot from their own maze — so venue cannot disambiguate either.
+ * The slug is all there is. Stripping the season prefix and the separators
+ * makes every express stem a prefix of its maze's stem
+ * ("killceanera" -> "killceanera_music_by_slash").
+ *
+ * Because that is a heuristic rather than a key, a stem matching zero or
+ * several mazes is left unpaired: the variant is still dropped from the
+ * entity list, but its wait is discarded rather than risking an express time
+ * published against the wrong maze. Wrong-but-plausible is worse than absent.
+ */
+export function buildExpressVariantMap(places: UniversalPlace[]): Map<string, string> {
+  const variants = places.filter(isExpressQueueVariant);
+  if (variants.length === 0) return new Map();
+
+  // Candidates are HHN rides only. Express queue lines exist solely for the
+  // ticketed event, so the maze is always HHN-namespaced — while the express
+  // twin's OWN id carries no such marker
+  // (`ush.lower_lot.rides.killer_klowns_express`). Matching an open prefix
+  // against every ride in the resort let a stem collide with an unrelated
+  // daytime attraction: a "Jurassic World - Express" line would have resolved
+  // to `jurassic_world_the_ride` and published an event wait on the daytime
+  // coaster. The `hits.length !== 1` guard cannot see that, because a single
+  // WRONG hit is still a single hit.
+  const candidates = places
+    .filter((place) => place.place_type?.type === 'Ride'
+      && !isExpressQueueVariant(place)
+      && /(^|[._])hhn/i.test(place.place_id))
+    .map((place) => ({id: sanitizeId(place.place_id), key: expressPairKey(place.place_id)}));
+
+  const pairs = new Map<string, string>();
+  for (const variant of variants) {
+    const stem = expressPairKey(variant.place_id);
+    if (!stem) continue;
+    const hits = candidates.filter((c) => c.key.startsWith(stem));
+    if (hits.length !== 1) {
+      console.warn(
+        `Universal: express variant ${variant.place_id} matched ${hits.length} attractions, dropping its wait`,
+      );
+      continue;
+    }
+    pairs.set(sanitizeId(variant.place_id), hits[0].id);
+  }
+  return pairs;
+}
+
+/**
+ * True for an event-flagged place whose NAME marks it as a variant of a
+ * canonical place that exists in the same feed — "Studio Tour - Mandarin"
+ * beside "Studio Tour".
+ *
+ * This exists because isEventVariantAlias's share-link signal is not
+ * trustworthy on its own. USH's Mandarin and Spanish Studio Tour variants
+ * aim their `social_sharing_link` at WATERWORLD, an unrelated show. Today
+ * that still resolves to "some other real place", so they are dropped and
+ * the answer happens to be right — but the reason is luck. If the feed ever
+ * nulls that link, or repoints it at an id the feed does not carry, both
+ * fall into the branch that deliberately KEEPS a record (the Epic Universe
+ * meets case), and the wiki gains two phantom SHOW entities named after a
+ * ride it already publishes. They are typed `Show` while the real Studio
+ * Tour is a `Ride`, so they would not even sit next to it.
+ *
+ * The name is the sturdier signal: it is what the variant is actually
+ * describing, and it does not depend on the feed getting a cross-reference
+ * right. Both rules run, so neither is load-bearing alone.
+ *
+ * Every " - " boundary is tried, so "A - B - C" matches a canonical "A" or
+ * "A - B". Only non-event places count as canonical, so two variants cannot
+ * validate each other. Names are space-normalised first — the feed mixes
+ * U+00A0 into these strings (see normalizeName).
+ */
+export function isNamedEventVariant(
+  place: UniversalPlace,
+  canonicalNames: Set<string>,
+): boolean {
+  if (attr(place, 'is_event') !== 'true') return false;
+  const name = normalizeName(place.name);
+  for (let i = name.indexOf(' - '); i > 0; i = name.indexOf(' - ', i + 1)) {
+    if (canonicalNames.has(name.slice(0, i))) return true;
+  }
+  return false;
+}
+
+/**
+ * Names a variant may legitimately defer to.
+ *
+ * Two exclusions, and the second is the load-bearing one:
+ *
+ *  - a place that is itself event-flagged, so two variants cannot validate
+ *    each other; and
+ *  - a place that does not become an entity at all. LANDS are the danger:
+ *    `ush.lower_lot.jurassic_world` is a Land named exactly "Jurassic World",
+ *    so without this the day the feed sets is_event on
+ *    "Jurassic World - The Ride" — and it already sets that flag on permanent
+ *    rides, `bowser.jr.challenge` among them — a headline coaster would be
+ *    read as a variant of its own land and silently deleted, wait time and
+ *    all. A variant defers to a real POI, never to the ground it stands on.
+ *
+ * Keeping only entity-producing places also keeps the rule honest about what
+ * it is for: collapsing a duplicate onto the thing actually published.
+ */
+export function canonicalPlaceNames(
+  places: UniversalPlace[],
+  destinationId = '',
+  timezone = 'UTC',
+): Set<string> {
+  return new Set(
+    places
+      .filter((p) => attr(p, 'is_event') !== 'true')
+      .filter((p) => placeToEntity(p, destinationId, timezone) !== null)
+      .map((p) => normalizeName(p.name))
+      .filter(Boolean),
+  );
+}
+
+/**
+ * Map a UniversalPlace to a wiki Entity. Returns null for place types we
+ * don't expose (Park is emitted separately by buildEntityList; Shop /
+ * Amenity / Hotel / etc. are out of scope for this migration).
+ */
+export function placeToEntity(
+  place: UniversalPlace,
+  destinationId: string,
+  timezone: string,
+): Entity | null {
+  const entityType = PLACE_TYPE_TO_ENTITY[place.place_type.type];
+  if (!entityType) return null;
+
+  const entity: Entity = {
+    id: sanitizeId(place.place_id),
+    name: place.name,
+    entityType,
+    destinationId,
+    timezone,
+  } as Entity;
+
+  if (place.venue_id) {
+    const venue = sanitizeId(place.venue_id);
+    if (venue in NON_SURFACED_VENUE_PARENT) {
+      const reparent = NON_SURFACED_VENUE_PARENT[venue];
+      // null → venue isn't represented on the wiki (e.g. CityWalk): drop the
+      // child rather than strand it under a parent that is never emitted.
+      if (reparent === null) return null;
+      (entity as any).parentId = reparent;
+    } else {
+      (entity as any).parentId = venue;
+    }
+  }
+
+  const mapLoc = place.geometry?.locations?.find((l) => l.location_type === 'map');
+  if (mapLoc?.lat_lng) {
+    entity.location = {latitude: mapLoc.lat_lng.lat, longitude: mapLoc.lat_lng.lng};
+  }
+
+  // Attraction-only attribute tags. Matches the surface the legacy
+  // POI-based build emitted: HasChildSwap → CHILD_SWAP, MinHeightInInches
+  // → MINIMUM_HEIGHT. The new feed exposes these under
+  // place_type.attributes[].
+  if (entityType === 'ATTRACTION') {
+    const tags: NonNullable<Entity['tags']> = [];
+    if (attr(place, 'has_child_swap') === 'true') {
+      tags.push(TagBuilder.childSwap());
+    }
+    const heightStr = attr(place, 'minimum_rider_height_inches');
+    if (heightStr) {
+      const inches = Number(heightStr);
+      if (Number.isFinite(inches) && inches > 0) {
+        tags.push(TagBuilder.minimumHeight(inches, 'in'));
+      }
+    }
+    if (tags.length > 0) entity.tags = tags;
+  }
+
+  return entity;
+}
+
+/**
+ * Convert a show-list entry's show_times[] to wiki LiveData showtimes.
+ * Filters to ENABLED slots in the future. Uses startTime === endTime
+ * because the feed doesn't carry a duration — match USJ's convention.
+ *
+ * The CDN feed gives UTC ISO strings (e.g. `2026-05-25T20:30:00.000Z`).
+ * We re-project each into the park-local timezone so the emitted
+ * startTime / endTime carries the proper `+HH:MM` offset — matches the
+ * legacy emission behaviour from the pre-/places code path. Bare UTC was
+ * being misinterpreted as "after-park-close" by downstream displays that
+ * naively rendered the Z string in local time.
+ */
+export function parseShowTimes(
+  show: UniversalShowListEntry,
+  timezone: string,
+  now: Date = new Date(),
+): Array<{type: string; startTime: string; endTime: string}> {
+  const out: Array<{type: string; startTime: string; endTime: string}> = [];
+  for (const slot of show.show_times ?? []) {
+    if (slot.status !== 'ENABLED') continue;
+    const t = new Date(slot.start_time);
+    if (!Number.isFinite(t.getTime()) || t < now) continue;
+    const startIso = formatInTimezone(t, timezone, 'iso');
+    out.push({type: 'Performance Time', startTime: startIso, endTime: startIso});
+  }
+  return out;
+}
+
+/**
+ * How long after a performance begins the show still counts as running.
+ *
+ * Backward-looking ONLY, and that is the whole design. A slot that has already
+ * started is evidence; a slot in the future is a prediction, and this feed's
+ * predictions cannot be trusted — USH's "Meet Hello Kitty" carries a slot
+ * stamped `2026-09-06T09:30:00.000Z`, tomorrow's 09:30 local written as UTC,
+ * landing at 02:30 in the morning. Anything that treats a future slot as proof
+ * inherits that phantom.
+ *
+ * Looking forward was also self-defeating: a symmetric window is 60 minutes
+ * wide, and ~80% of Hollywood's and ~92% of Orlando's gaps between consecutive
+ * slots are 60 minutes or less, so the union covered a show's ENTIRE day —
+ * nearly four hours unbroken for Meet HamiKuma. It stopped meaning "performing
+ * now" and started meaning "somewhere in this show's day", which is the day
+ * gate switched off. Backward-only at 30 minutes cannot tile: 30 on, 30 off at
+ * hourly cadence.
+ *
+ * What it gives up is the about-to-start case — HamiKuma at 18:05 with an
+ * 18:30 slot now reads CLOSED. That is the honest answer: at 18:05 the show
+ * has not started.
+ */
+const PERFORMANCE_UNDERWAY_MS = 30 * 60 * 1000;
+
+/**
+ * How far past a park's posted close the imminent rule may still apply.
+ *
+ * Unbounded, the rule resurrects a show from a single mis-stamped slot. USH's
+ * "Meet Hello Kitty" carries eleven slots across 09:00-15:00 PDT and a twelfth
+ * at `2026-09-06T09:30:00.000Z` — tomorrow's 09:30 local stamped `Z` instead
+ * of `-07:00`, landing at 02:30 PDT. With the park shut since 18:00 and the
+ * event over at 02:00, that one row published OPERATING for a full hour in the
+ * middle of the night: exactly the overnight staleness this gate exists to
+ * stop, reached through one bad slot rather than a stale list.
+ *
+ * No window geometry separates that slot from Celestial Goodnight's — both sit
+ * 30 minutes past their day's last close. What separates them is which
+ * operating session they belong to, so the rule is anchored to the CURRENT
+ * one: it may reach an hour past close (a closing spectacular performs there)
+ * and no further (the small hours are not an operating session).
+ */
+const POST_CLOSE_GRACE_MS = 60 * 60 * 1000;
+
+/**
+ * True when the show has an ENABLED performance that has ALREADY BEGUN within
+ * the last half hour, inside an operating session — so the show is running
+ * whatever the published hours say.
+ *
+ * Read from the RAW slots rather than parseShowTimes' output, which drops
+ * anything already started. That drop is exactly what hides this case: a
+ * single-performance show is at its most obviously running during the half
+ * hour after it begins, yet from the parsed list Celestial Goodnight at 20:35
+ * is indistinguishable from a show that finished for the day.
+ *
+ * The slot must sit inside an operating session as well as `now`. Anchoring
+ * only the instant left a slot stamped before the park opened able to fire
+ * from just after opening.
+ */
+export function hasPerformanceUnderway(
+  show: UniversalShowListEntry,
+  now: Date,
+  bounds: ReadonlyArray<{start: number; end: number}>,
+  windowMs: number = PERFORMANCE_UNDERWAY_MS,
+): boolean {
+  const nowMs = now.getTime();
+  const inside = (ms: number) => bounds.some((b) => ms >= b.start && ms <= b.end);
+  if (!inside(nowMs)) return false;
+  return (show.show_times ?? []).some((slot) => {
+    if (slot.status !== 'ENABLED') return false;
+    const start = Date.parse(slot.start_time);
+    // Started, and not more than windowMs ago. A future slot never counts.
+    return Number.isFinite(start)
+      && start <= nowMs
+      && nowMs - start <= windowMs
+      && inside(start);
+  });
+}
+
+/**
+ * Map a show-list entry's `status` to a wiki live status.
+ *
+ * Universal reuses its ride operating-state vocabulary for shows. The original
+ * mapping treated every value except 'OPEN' as CLOSED, which mislabelled a show
+ * that is merely delayed (BRIEF_DELAY / WEATHER_DELAY) or at capacity as CLOSED
+ * even while it still listed a full day of ENABLED performances — the reported
+ * CLOSED-with-showtimes contradiction. Mirror the attraction status semantics
+ * so a delayed show reads DOWN.
+ *
+ * `hasFutureShowtimes` closes the contradiction structurally rather than by
+ * enumerating today's known statuses: a show still advertising future ENABLED
+ * performances is operating today (e.g. character meet-and-greets that report
+ * `CLOSED` between appearances), so it is never emitted as CLOSED alongside a
+ * live schedule. Explicit long closures (EXTENDED_CLOSURE / COMING_SOON) still
+ * win over stray showtimes. Delay states stay DOWN — DOWN + showtimes is
+ * coherent (interrupted but scheduled).
+ *
+ * `parkOperating` clock-gates every path that would otherwise resolve to
+ * OPERATING. Two independent things stay stale straight through an
+ * overnight closure, and both were observed live at USH (programme#86),
+ * not just theorised:
+ *   - `show_times` lists the *whole day's* ENABLED performances from
+ *     midnight, so "has a future slot" (`hasFutureShowtimes`) stays true
+ *     all night once the feed rolls to the next operating day.
+ *   - The `status` field itself is not reliably live either. Sampled at
+ *     03:24 PDT with USH's own schedule confirming the park shut, 25 of
+ *     31 externally-shown entries carried `status: "OPEN"` outright — the
+ *     same category of stale-reading bug already fixed for the ride
+ *     wait-time feed (parksapi #316), just on the status field instead of
+ *     a queue reading. An explicit `OPEN`/`RIDE_NOW` is therefore trusted
+ *     only while the park is actually open.
+ * Long-closure (EXTENDED_CLOSURE / COMING_SOON) and delay (BRIEF_DELAY /
+ * WEATHER_DELAY / AT_CAPACITY) signals are NOT gated — neither claims the
+ * show is operating, so there is nothing for the clock to override.
+ * Default true (ungated) when hours are unknown — callers pass false only
+ * when a schedule lookup positively confirms the park shut.
+ */
+export function mapUniversalShowStatus(
+  status: string | undefined,
+  hasFutureShowtimes = false,
+  parkOperating = true,
+  performingNow = false,
+): 'OPERATING' | 'DOWN' | 'CLOSED' {
+  switch (status) {
+    case 'OPEN':
+    case 'RIDE_NOW':
+      return (parkOperating || performingNow) ? 'OPERATING' : 'CLOSED';
+    case 'BRIEF_DELAY':
+    case 'WEATHER_DELAY':
+    case 'AT_CAPACITY':
+      return 'DOWN';
+    case 'EXTENDED_CLOSURE':
+    case 'COMING_SOON':
+      // Strong "not running for a while" signals win over any stray showtimes.
+      return 'CLOSED';
+    default:
+      // CLOSED / CANCELED / unknown: operating today iff it still lists future
+      // ENABLED performances AND the park is actually open right now — or a
+      // performance is happening regardless of what the hours say.
+      return ((hasFutureShowtimes && parkOperating) || performingNow)
+        ? 'OPERATING'
+        : 'CLOSED';
+  }
+}
+
+// ─── shows/show-list.json (CDN) types ────────────────────────────────────────
+
+export type UniversalShowTime = {
+  show_time_id: string;
+  status: string;             // 'ENABLED' | …
+  start_time: string;         // ISO UTC e.g. '2026-05-22T14:00:00.000Z'
+  asl?: boolean;
+};
+
+export type UniversalShowListEntry = {
+  show_id: string;
+  resort_area_code: string;
+  venue_id?: string;
+  land_id?: string;
+  name: string;
+  show_type?: string;
+  /** Feed category such as `hhn` for ticketed-event-only shows. */
+  category?: string;
+  status: string;             // 'OPEN' | …
+  show_externally: boolean;
+  show_times?: UniversalShowTime[];
+};
+
+/**
+ * One Express Now offer, post-parsing.
+ *
+ * Numeric fields arrive as strings on the wire (Flutter parser uses
+ * `int.parse` / `double.parse` on every numeric field) — we coerce them
+ * once here so downstream code never has to.
+ */
+export type ExpressNowOffer = {
+  offer_id: string;
+  place_id: string;
+  inventory_time_slot: string;   // ISO datetime — return window start (park-local, no offset)
+  inventory_time_minutes: number; // window length
+  product_price: number;          // USD, decimal
+  vl_inventory: number;           // remaining inventory
+};
+
+/**
+ * Pure parser for the Express Now `/get-offers` response body. Coerces the
+ * string-typed numeric fields, drops malformed entries, and groups by
+ * `place_id` keeping the earliest-starting offer per place.
+ *
+ * Exported for unit testing — the reference payload is the first real
+ * sample that came back from the live endpoint (Spider-Man, Mardi Gras
+ * late-close window).
+ */
+// Required `inventory_time_slot` format. Must be enforced at parse time —
+// downstream emission feeds the value into `parseTimeInTimezone` and `new
+// Date()`, both of which would silently produce an Invalid Date for
+// anything else, then `formatInTimezone` would throw mid-buildLiveData.
+const SLOT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/;
+
+export function parseExpressNowResponse(data: unknown): Record<string, ExpressNowOffer> {
+  const predictions: any[] = Array.isArray((data as any)?.predictions) ? (data as any).predictions : [];
+  const grouped: Record<string, ExpressNowOffer> = {};
+
+  for (const raw of predictions) {
+    const placeId = raw?.place_id;
+    if (typeof placeId !== 'string' || !placeId) continue;
+    if (typeof raw?.offer_id !== 'string' || !raw.offer_id) continue;
+    if (typeof raw?.inventory_time_slot !== 'string' || !SLOT_RE.test(raw.inventory_time_slot)) continue;
+
+    const parsed: ExpressNowOffer = {
+      offer_id: raw.offer_id,
+      place_id: placeId,
+      inventory_time_slot: raw.inventory_time_slot,
+      inventory_time_minutes: parseInt(raw.inventory_time_minutes, 10),
+      product_price: parseFloat(raw.product_price),
+      vl_inventory: parseInt(raw.vl_inventory, 10),
+    };
+
+    if (!Number.isFinite(parsed.product_price)
+        || !Number.isFinite(parsed.inventory_time_minutes)
+        || !Number.isFinite(parsed.vl_inventory)) continue;
+
+    const existing = grouped[placeId];
+    // The slot format is fixed `YYYY-MM-DDTHH:mm:ss` (validated above) —
+    // lexicographic compare is chronologically equivalent and avoids
+    // assuming the runtime and park timezone agree (`new Date()` parses
+    // naive ISO as local).
+    if (!existing || parsed.inventory_time_slot < existing.inventory_time_slot) {
+      grouped[placeId] = parsed;
+    }
+  }
+  return grouped;
+}
+
+/**
+ * Universal schedule API response.
+ *
+ * Real captures (src/parks/universal/gentype/Universal{Orlando,Studios}.
+ * fetchVenueSchedule.ts) show this shape varies by resort: UOR omits
+ * `VenueStatus`/`OpenTimeString`/`CloseTimeString` entirely on some days
+ * (closed days), USH never sends `VenueStatus` at all. All optional here to
+ * match. `SpecialEntryUnix` is real (both resorts send it on every day) but
+ * has been 0 on every day observed across ~11 weeks for all 5 venues,
+ * including deep into a would-be Halloween Horror Nights window — its
+ * semantics (a separate early-access tier? populated only near an actual
+ * special-hours date?) are unconfirmed, so isParkOperatingNow deliberately
+ * does not act on it yet. See the isParkOperatingNow doc comment.
+ */
+type UniversalScheduleResponse = Array<{
+  Date: string;
+  VenueStatus?: string;
+  OpenTimeString?: string;
+  CloseTimeString?: string;
+  EarlyEntryString?: string;
+  SpecialEntryUnix?: number;
+}>;
+
+/**
+ * True/false while `now` is inside/outside a ticketed-event calendar. `null`
+ * means the calendar cannot answer the question, so callers must treat it as
+ * unknown rather than as proof that event shows are closed.
+ *
+ * A malformed night is skipped rather than abandoning the whole calendar. The
+ * calendar covers a whole season — Hollywood publishes 42 nights — and one
+ * bad row in November must not disable the gate every night until then. Only
+ * two things make the answer unknown, mirroring isParkOperatingNow's
+ * sawValid/sawMalformed shape (though not its relevance rule — that one
+ * compares two timezone projections of the same day and returns a plain
+ * boolean):
+ *
+ *  - a malformed night on a date that could still be running right now
+ *    (tonight's, or last night's for a window that crosses midnight), because
+ *    the row that would have answered the question is the broken one; or
+ *  - no usable night anywhere, which is indistinguishable from a fetch that
+ *    returned a document we failed to understand.
+ *
+ * A calendar with usable nights, none of them covering `now`, is the ordinary
+ * off-season/daytime case and answers a confident false.
+ *
+ * KNOWN GAP, deliberately not closed here. Those two valves only see rows
+ * that reached this function. parseUniversalEventCalendar already hard-
+ * validates each date and time before building a night, so for calendars it
+ * produces the malformed-row case is close to unreachable — while the failure
+ * that DOES occur upstream, a CMS block dropped for unreadable labels, never
+ * arrives as a row at all. The remaining nights then set sawUsableNight and a
+ * dropped night reads as a confident false, which is the wrong direction. The
+ * fix belongs in the parser (count dropped blocks and surface them), not in
+ * re-validating rows that were validated on the way in. Tracked separately;
+ * behaviour here is unchanged from before this gate existed.
+ */
+export function isUniversalEventOperatingNow(
+  nights: UniversalEventNight[],
+  now: Date,
+  timezone: string,
+): boolean | null {
+  const window = universalEventWindowAt(nights, now, timezone);
+  return window === undefined ? null : window !== null;
+}
+
+/**
+ * The ticketed-event window covering `now`, or `null` when none does, or
+ * `undefined` when the calendar cannot answer (the `null` case of
+ * isUniversalEventOperatingNow — see that function for the rules, which this
+ * implements).
+ *
+ * The window END is what callers need beyond a yes/no: an ordinary show
+ * performing INSIDE the event is operating, while one whose only remaining
+ * slot is tomorrow morning is not, and both look identical to a boolean.
+ */
+export function universalEventWindowAt(
+  nights: UniversalEventNight[],
+  now: Date,
+  timezone: string,
+): {opensAt: number; closesAt: number} | null | undefined {
+  const nowMs = now.getTime();
+  const validDate = /^\d{4}-\d{2}-\d{2}$/;
+  const validTime = /^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/;
+
+  // Nights whose window could plausibly still be open at `now`. A night is
+  // keyed to the date it starts, so an event running past midnight is still
+  // yesterday's row.
+  const today = formatDate(now, timezone);
+  const relevantDates = new Set([today, shiftDateString(today, -1)]);
+
+  let sawUsableNight = false;
+  let sawMalformedRelevantNight = false;
+
+  for (const night of nights) {
+    // A night can only be ruled out as irrelevant if its DATE is usable —
+    // "2026-13-45" clears the regex but is not a real day, and a date we
+    // cannot place in time might be the very window covering `now`. Such a
+    // night therefore counts as relevant, so it downgrades the answer to
+    // unknown instead of being quietly skipped past into a confident closed.
+    // A usable date with a broken TIME is different: we can still tell it is
+    // months away, and skipping it is the whole point of this loop.
+    const dateUsable = validDate.test(night.date)
+      && Number.isFinite(new Date(`${night.date}T12:00:00Z`).getTime());
+    const relevant = !dateUsable || relevantDates.has(night.date);
+    if (!dateUsable
+        || !validTime.test(night.openingTime)
+        || !validTime.test(night.closingTime)) {
+      if (relevant) sawMalformedRelevantNight = true;
+      continue;
+    }
+    let openingMs: number;
+    let closingMs: number;
+    try {
+      // Admission, not the advertised start: guests are inside during early
+      // access, so an hhn-tagged show performing then is genuinely running.
+      // The published TICKETED_EVENT window is untouched — early access is a
+      // separate INFO entry in buildSchedules.
+      const admitsFrom = night.earlyAccessTime && night.earlyAccessTime < night.openingTime
+        ? night.earlyAccessTime
+        : night.openingTime;
+      openingMs = new Date(constructDateTime(night.date, admitsFrom, timezone)).getTime();
+      const closingDate = night.closesNextDay ? shiftDateString(night.date, 1) : night.date;
+      closingMs = new Date(constructDateTime(closingDate, night.closingTime, timezone)).getTime();
+    } catch {
+      if (relevant) sawMalformedRelevantNight = true;
+      continue;
+    }
+    if (!Number.isFinite(openingMs) || !Number.isFinite(closingMs) || closingMs <= openingMs) {
+      if (relevant) sawMalformedRelevantNight = true;
+      continue;
+    }
+    sawUsableNight = true;
+    if (nowMs >= openingMs && nowMs <= closingMs) return {opensAt: openingMs, closesAt: closingMs};
+  }
+
+  if (sawMalformedRelevantNight) return undefined;
+  return sawUsableNight ? null : undefined;
+}
+
+@config
+class Universal extends Destination {
+  @config
+  secretKey: string = "";
+
+  @config
+  appKey: string = "";
+
+  @config
+  vQueueURL: string = "";
+
+  @config
+  baseURL: string = "";
+
+  @config
+  assetsBase: string = "";
+
+  /** UDX platform API base — used by Express Now (new Flutter app API). */
+  @config
+  udxBase: string = "";
+
+  /** UDX OAuth2 client ID. */
+  @config
+  udxClientId: string = "";
+
+  /** UDX OAuth2 client secret. */
+  @config
+  udxClientSecret: string = "";
+
+  /**
+   * Flutter app API key for UDX calls (e.g. `UORFlutterAndroidApp`). The
+   * legacy Android key (`AndroidMobileApp`) is rejected by the Express Now
+   * endpoint — a resort-specific Flutter key is required.
+   */
+  @config
+  flutterAppKey: string = "";
+
+  /** Flutter app version sent on UDX requests. Rotates with app updates. */
+  @config
+  flutterAppVersion: string = "";
+
+  /**
+   * Park centre latitude — used to jitter Express Now offers requests.
+   * NaN by default so the `Number.isFinite` guard in `getExpressNowOffers`
+   * fails until the value is actually configured. (A literal `0` for a
+   * park sited at the equator is a valid finite value and would pass.)
+   */
+  @config
+  parkLatitude: number = NaN;
+
+  /** Park centre longitude. NaN by default — see `parkLatitude`. */
+  @config
+  parkLongitude: number = NaN;
+
+  @config
+  city: string = "orlando";
+
+  /** Resort-level (destination) coordinates. Overridden per subclass. */
+  resortLocation: {latitude: number; longitude: number} = {latitude: 28.4719, longitude: -81.4685};
+
+  @config
+  resortName: string = "Universal Orlando Resort";
+
+  @config
+  resortSlug: string = "universalorlando";
+
+  @config
+  resortKey: string = "uor";
+
+  @config
+  timezone: string = "America/New_York";
+
+  /**
+   * Halloween Horror Nights attractions are absent from
+   * wait-time-attraction-list.json outside the event rather than listed as
+   * closed, so buildLiveData() has nothing to key off and the row freezes at
+   * whatever the last event night reported (parksapi #519). See
+   * Destination.retireMissingLiveEntities for the mechanism.
+   */
+  protected retireMissingLiveEntities = true;
+
+  /**
+   * The shared default is a week, sized for shows that retire at the end of
+   * a run. HHN leaves the feed at closing time and rejoins it the next event
+   * night, so a week would never fire mid-season.
+   *
+   * Four hours sits between the two bounds that matter. The event runs while
+   * the day park is shut, when the collector polls every 45 minutes, so the
+   * window has to clear a gap of that order: four hours spans roughly five
+   * consecutive polls. It also has to fire inside the daytime absence, which
+   * runs from a 01:00-02:00 close to 18:30 doors, and a close at 05:00-06:00
+   * leaves over twelve hours of margin. Eight hours would not: after a peak
+   * weekend it fires at 10:00, and #519 was reported at 10:51.
+   */
+  protected liveEntityRetirementMs = 4 * 60 * 60 * 1000;
+
+  /**
+   * Full URL of the website page payload carrying the ticketed-event calendar
+   * (Halloween Horror Nights). The base remains empty so an unconfigured
+   * resort never touches the site; Hollywood supplies its official calendar
+   * as a subclass default. The whole URL rather than a path is used because
+   * each resort's event lives on its own microsite.
+   */
+  @config
+  eventCalendarURL: string = '';
+
+  /**
+   * Place id of the park the event runs in, e.g. `uor.usf`. The event calendar
+   * covers one park, not the resort, and without this there is nothing to
+   * attach the schedule to.
+   */
+  @config
+  eventCalendarPlaceId: string = '';
+
+  constructor(options?: DestinationConstructor) {
+    super(options);
+    this.addConfigPrefix('UNIVERSALSTUDIOS');
+  }
+
+  /**
+   * Fetch the event calendar page payload.
+   *
+   * Served as `text/html` but is JSON throughout, so it is read as text and
+   * parsed here rather than letting the HTTP layer decide by content type.
+   */
+  // `calendarURL` defaults rather than being required so that Function.length
+  // stays 0: the health harness skips any @http method with a positive
+  // paramCount and no healthCheckArgs (src/harness/health.ts), and a required
+  // parameter here would quietly drop the event calendar out of endpoint
+  // monitoring. fetchEventNights still passes the URL explicitly, so both the
+  // @http and @cache keys stay URL-derived.
+  @http({cacheSeconds: 43200, retries: 1} as any)
+  async fetchEventCalendar(calendarURL: string = this.eventCalendarURL): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: calendarURL,
+      options: {json: false},
+      tags: ['website'],
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Ticketed-event nights for this resort, or [] when not configured.
+   *
+   * The "not configured" answers are deliberately resolved OUTSIDE the cache.
+   * Cached, they write [] to the same key a configured run reads back, so a
+   * single unconfigured start silently ungates event shows for the next 12
+   * hours; the empty result is also free to recompute. Only the fetch and
+   * parse are worth caching, and they are keyed by the URL they came from so
+   * repointing the calendar takes effect immediately instead of at the next
+   * TTL expiry.
+   */
+  async getEventNights(): Promise<UniversalEventNight[]> {
+    if (!this.eventCalendarURL || !this.eventCalendarPlaceId) return [];
+    // UniversalOrlando and UniversalStudios share addConfigPrefix
+    // ('UNIVERSALSTUDIOS'), so Hollywood reads Orlando's calendar config too.
+    // buildSchedules() would never emit those nights — the place id matches
+    // none of its parks — but without this Hollywood still fetches and parses
+    // a 285KB Orlando document on every schedule build.
+    if (!this.parkPlaceIds().includes(this.eventCalendarPlaceId)) return [];
+    return await this.fetchEventNights(this.eventCalendarURL);
+  }
+
+  /**
+   * Fetch and parse the configured event calendar.
+   *
+   * `calendarURL` is passed rather than read from `this` purely so it lands in
+   * the cache key: the same class repointed at a different microsite must not
+   * serve the previous site's nights.
+   */
+  @cache({ttlSeconds: 43200})
+  protected async fetchEventNights(calendarURL: string): Promise<UniversalEventNight[]> {
+    const body = await (await this.fetchEventCalendar(calendarURL)).text();
+    return parseUniversalEventCalendar(JSON.parse(body));
+  }
+
+  /** Place ids of the parks belonging to this resort. */
+  parkPlaceIds(): string[] {
+    return Object.keys(PARK_PLACE_ID_TO_LEGACY_VENUE_ID)
+      .filter(placeId => placeId.startsWith(`${this.resortKey}.`));
+  }
+
+  /**
+   * Inject API key into all HTTP requests for Universal's API
+   */
+  @inject({
+    eventName: 'httpRequest',
+    hostname: function() {
+      return new URL(this.baseURL).hostname;
+    },
+    tags: {$nin: ['apiKeyFetch']}
+  })
+  async injectAPIKey(requestObj: HTTPObj): Promise<void> {
+    const apiKeyData = await this.getAPIKey();
+
+    requestObj.headers = {
+      ...requestObj.headers,
+      'X-UNIWebService-ApiKey': this.appKey,
+      'X-UNIWebService-Token': apiKeyData.apiKey,
+    };
+  }
+
+  // ─── UDX platform API (Express Now, new Flutter app) ────────────────────
+
+  /**
+   * Inject Bearer token + Flutter-app fingerprint headers on UDX requests.
+   * Skipped for the OAuth call itself (tagged `udxAuth`).
+   */
+  @inject({
+    eventName: 'httpRequest',
+    hostname: function() {
+      if (!this.udxBase) return null;
+      return hostnameFromUrl(this.udxBase);
+    },
+    tags: {$nin: ['udxAuth']},
+  })
+  async injectUdxToken(requestObj: HTTPObj): Promise<void> {
+    if (!this.udxBase) return;
+    const {token} = await this.getUdxToken();
+    const headers: Record<string, string> = {
+      ...requestObj.headers,
+      'user-agent': 'Dart/3.11 (dart:io)',
+      'accept-language': 'en-US',
+      'x-uniwebservice-platform': 'Android',
+      'x-uniwebservice-platformversion': '14',
+      'x-uniwebservice-device': 'ONEPLUS A5000',
+      'x-channel-type': 'Mobile',
+      'Authorization': `Bearer ${token}`,
+    };
+    if (this.flutterAppVersion) {
+      headers['x-uniwebservice-appversion'] = this.flutterAppVersion;
+    }
+    requestObj.headers = headers;
+  }
+
+  /** Fetch UDX OAuth2 token via client credentials. The request-level
+   * `tags: ['udxAuth']` (on the returned HTTPObj) is what `injectUdxToken`
+   * matches against to skip itself for this call. */
+  @http()
+  async fetchUdxToken(): Promise<HTTPObj> {
+    if (!this.udxBase || !this.udxClientId || !this.udxClientSecret) {
+      throw new Error(
+        `Universal UDX: missing config (udxBase=${!!this.udxBase}, udxClientId=${!!this.udxClientId}, udxClientSecret=${!!this.udxClientSecret}). ` +
+        `Set UNIVERSALSTUDIOS_UDXBASE / UNIVERSALSTUDIOS_UDXCLIENTID / UNIVERSALSTUDIOS_UDXCLIENTSECRET in .env.`,
+      );
+    }
+    const credentials = Buffer.from(`${this.udxClientId}:${this.udxClientSecret}`).toString('base64');
+    return {
+      method: 'POST',
+      url: `${this.udxBase}/oidc/connect/token`,
+      body: 'scope=default&grant_type=client_credentials',
+      headers: {
+        'Authorization': `Basic ${credentials}`,
+        'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+        'user-agent': 'Dart/3.11 (dart:io)',
+      },
+      tags: ['udxAuth'],
+    } as any as HTTPObj;
+  }
+
+  /** Cached UDX access token. */
+  @cache({callback: (resp: {token: string; expiresIn: number}) => resp?.expiresIn || 3600})
+  async getUdxToken(): Promise<{token: string; expiresIn: number}> {
+    const resp = await this.fetchUdxToken();
+    const data: any = await resp.json();
+    if (!data?.access_token) {
+      throw new Error('Universal UDX: no access_token in response');
+    }
+    // expires_in is normally a number, but some OAuth servers stringify it —
+    // coerce so the @cache TTL callback always sees a finite number.
+    const expiresIn = Number(data.expires_in);
+    return {
+      token: data.access_token,
+      expiresIn: Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 3600,
+    };
+  }
+
+  /**
+   * Inject Express Now headers (resort code + Flutter app key). The legacy
+   * `X-UNIWebService-ApiKey: AndroidMobileApp` is rejected here — UDX wants
+   * the resort-specific Flutter key.
+   */
+  @inject({
+    eventName: 'httpRequest',
+    hostname: function() {
+      if (!this.udxBase) return null;
+      return hostnameFromUrl(this.udxBase);
+    },
+    tags: 'expressNowOffers',
+  })
+  async injectExpressNowHeaders(requestObj: HTTPObj): Promise<void> {
+    const flutterKey = this.flutterAppKey || `${this.resortKey.toUpperCase()}FlutterAndroidApp`;
+    requestObj.headers = {
+      ...requestObj.headers,
+      'x-resort-area-code': this.resortKey.toUpperCase(),
+      'X-UNIWebService-ApiKey': flutterKey,
+    };
+  }
+
+  /**
+   * Stable instance UUID for unauthenticated Express Now calls. The Flutter
+   * app generates one v4 UUID per install and reuses it as the long-lived
+   * guest identifier — we cache for 30 days to mirror that behaviour.
+   */
+  @cache({ttlSeconds: 60 * 60 * 24 * 30})
+  async getExpressNowInstanceId(): Promise<string> {
+    return crypto.randomUUID();
+  }
+
+  /**
+   * POST UDX `/instances/{instanceId}/get-offers`. The lat/lon are jittered
+   * within 150m of the park centre per request so successive polls don't
+   * fingerprint as identical.
+   */
+  @http({retries: 0})
+  async fetchExpressNowOffers(): Promise<HTTPObj> {
+    const instanceId = await this.getExpressNowInstanceId();
+    const point = randomPointInRadius(
+      {latitude: this.parkLatitude, longitude: this.parkLongitude},
+      150,
+    );
+    return {
+      method: 'POST',
+      url: `${this.udxBase}/instances/${instanceId}/get-offers`,
+      body: {
+        location_lat: String(point.latitude),
+        location_long: String(point.longitude),
+        device_id: instanceId,
+      },
+      options: {json: true},
+      tags: ['expressNowOffers'],
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Get parsed Express Now offers, grouped by `place_id`.
+   * Empty object when Express Now isn't selling (404 / `OFFERS_NOT_FOUND`).
+   * Throws on any other error so transient failures aren't cached as empty.
+   *
+   * TTL is dynamic: 60s when there are live offers (we want fresh inventory),
+   * 10min when the endpoint confirms OFFERS_NOT_FOUND (no point re-polling
+   * a stable "nothing for sale" — and re-polling generates a 404 log entry
+   * from the http layer each time).
+   */
+  async getExpressNowOffers(): Promise<Record<string, ExpressNowOffer>> {
+    // Resolved outside the cache, for the same reason getEventNights does it:
+    // an unconfigured instance would otherwise write {} to the key a
+    // configured one reads back and blind it for the full empty-result TTL.
+    if (!this.udxBase || !Number.isFinite(this.parkLatitude) || !Number.isFinite(this.parkLongitude)) return {};
+    return await this.fetchExpressNowOfferMap();
+  }
+
+  /** The cached half of getExpressNowOffers: only reached when configured. */
+  @cache({callback: (offers: Record<string, ExpressNowOffer>) => Object.keys(offers).length === 0 ? 600 : 60})
+  protected async fetchExpressNowOfferMap(): Promise<Record<string, ExpressNowOffer>> {
+    let resp: HTTPObj;
+    try {
+      resp = await this.fetchExpressNowOffers();
+    } catch (err: any) {
+      const msg = String(err?.message ?? err);
+      // The 404 response always carries `"problem":"OFFERS_NOT_FOUND"` in
+      // the body — match on that specifically. A bare `404` substring would
+      // also swallow misconfiguration / wrong path / auth-rejection-as-404,
+      // masking real bugs behind the long empty-result TTL.
+      if (msg.includes('OFFERS_NOT_FOUND')) return {};
+      // Anything else (network / 5xx / parse / unexpected 404) is transient
+      // or a real bug — let it bubble so @cache doesn't poison the result.
+      // buildLiveData catches and degrades gracefully.
+      throw err;
+    }
+
+    return parseExpressNowResponse(await resp.json());
+  }
+
+  // ─── Legacy API (services.universalorlando.com) ─────────────────────────
+
+  /**
+   * Handle 401 responses by clearing cached API key
+   */
+  @inject({
+    eventName: 'httpError',
+    hostname: function() {
+      return new URL(this.baseURL).hostname;
+    },
+  })
+  async handleUnauthorized(requestObj: HTTPObj): Promise<void> {
+    if (requestObj.response?.status === 401) {
+      // Clear cached API key to force refresh
+      const {CacheLib} = await import('../../cache.js');
+      CacheLib.delete(`${this.constructor.name}:APIKey:${this.city}`);
+    }
+  }
+
+  /**
+   * Get API authentication token
+   */
+  @cache({
+    callback: (response) => response?.expiresIn || 3600,
+    key: function() {
+      return `${this.constructor.name}:APIKey:${this.city}`;
+    }
+  })
+  async getAPIKey(): Promise<{apiKey: string; expiresIn: number}> {
+    const resp = await this.fetchAPIKey();
+    if (!resp.response || !resp.response.ok) {
+      throw new Error(`Failed to fetch API key: ${resp.response?.status} ${resp.response?.statusText}`);
+    }
+    const respJson: any = await resp.json();
+
+    const expireTime: number = respJson.TokenExpirationUnix;
+    let tokenExpiration: number = (expireTime * 1000) - Date.now();
+    // Expire at least 5 minutes before actual expiration
+    tokenExpiration = Math.max(tokenExpiration - (5 * 60 * 1000), 60 * 5 * 1000);
+
+    return {
+      apiKey: respJson.Token,
+      expiresIn: Math.floor(tokenExpiration / 1000),
+    };
+  }
+
+  /**
+   * Fetch API key from authentication endpoint
+   */
+  @http()
+  async fetchAPIKey(): Promise<HTTPObj> {
+    const now = new Date();
+    const today = formatUTC(now, 'ddd, DD MMM YYYY HH:mm:ss') + ' GMT';
+
+    const signatureBuilder = crypto.createHmac('sha256', this.secretKey);
+    signatureBuilder.update(`${this.appKey}\n${today}\n`);
+    const signature = signatureBuilder.digest('base64').replace(/=$/, '\u003d');
+
+    return {
+      method: 'POST',
+      url: `${this.baseURL}?city=${this.city}`,
+      body: {
+        apiKey: this.appKey,
+        signature: signature,
+      },
+      headers: {
+        'Date': today,
+      },
+      options: {
+        json: true,
+      },
+      tags: ['apiKeyFetch']
+    } as any as HTTPObj;
+  }
+
+  /** Fetch /resort-areas/{resortKey}/places via UDX (Bearer auth + Flutter headers). */
+  @http({cacheSeconds: 60 * 60 * 12})
+  async fetchPlaces(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.udxBase}/resort-areas/${this.resortKey.toUpperCase()}/places`,
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /** Parsed places list — long TTL since place definitions move slowly. */
+  @cache({ttlSeconds: 60 * 60 * 12})
+  async getPlaces(): Promise<UniversalPlace[]> {
+    const resp = await this.fetchPlaces();
+    const data: UniversalPlacesResponse = await resp.json();
+    return (data?.results ?? []).map((r) => r.place);
+  }
+
+  /** Fetch /shows/show-list.json from the public CDN (no auth needed). */
+  @http({cacheSeconds: 60})
+  async fetchShowList(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.assetsBase}/${this.resortKey}/shows/show-list.json`,
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /** Parsed show-list — short TTL since show times update through the day. */
+  @cache({ttlSeconds: 60})
+  async getShowList(): Promise<UniversalShowListEntry[]> {
+    const resp = await this.fetchShowList();
+    const data = await resp.json();
+    // Shows are published from this feed alone, so coercing an unexpected
+    // shape to [] would read as "every show ended" rather than "the feed
+    // broke" — and with retirement enabled that difference is a day's worth
+    // of shows force-closed mid-performance. Fail instead: a throw withholds
+    // the whole push and leaves the previous values standing.
+    if (!Array.isArray(data)) {
+      throw new Error(`Universal: show-list.json returned ${typeof data}, expected an array`);
+    }
+    return data as UniversalShowListEntry[];
+  }
+
+  /**
+   * Fetch wait time data
+   */
+  @http({cacheSeconds: 60})
+  async fetchWaitTimes(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.assetsBase}/${this.resortKey}/wait-time/wait-time-attraction-list.json`,
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Get wait time data (cached)
+   */
+  @cache({ttlSeconds: 60})
+  async getWaitTimes(): Promise<UniversalWaitTimeResponse> {
+    const resp = await this.fetchWaitTimes();
+    return await resp.json();
+  }
+
+  /**
+   * Fetch virtual queue states
+   */
+  @http({cacheSeconds: 60})
+  async fetchVirtualQueueStates(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.baseURL}/Queues`,
+      queryParams: {
+        city: this.city,
+        page: '1',
+        pageSize: 'all',
+      },
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Get virtual queue states (cached)
+   */
+  @cache({ttlSeconds: 60})
+  async getVirtualQueueStates(): Promise<UniversalVirtualQueueState[]> {
+    const resp = await this.fetchVirtualQueueStates();
+    const data: any = await resp.json();
+    // An absent Results array is a broken response, not an empty queue list.
+    if (!data || !Array.isArray(data.Results)) {
+      throw new Error('Universal: /Queues returned no Results array');
+    }
+    return data.Results as UniversalVirtualQueueState[];
+  }
+
+  /**
+   * Fetch virtual queue details for a specific queue
+   */
+  @http({
+    cacheSeconds: 60, parameters: [
+      {name: 'queueId', type: 'string', description: 'Virtual queue ID to fetch details for'}
+    ]
+  })
+  async fetchVirtualQueueDetails(queueId: string): Promise<HTTPObj> {
+    const todaysDate = formatInTimezone(new Date(), this.timezone, 'date');
+
+    return {
+      method: 'GET',
+      url: `${this.baseURL}/${this.vQueueURL}/${queueId}`,
+      queryParams: {
+        page: '1',
+        pageSize: 'all',
+        city: this.city,
+        appTimeForToday: todaysDate,
+      },
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Get virtual queue details (cached)
+   */
+  @cache({ttlSeconds: 60})
+  async getVirtualQueueDetails(queueId: string): Promise<UniversalVirtualQueueDetails> {
+    const resp = await this.fetchVirtualQueueDetails(queueId);
+    return await resp.json();
+  }
+
+  /**
+   * Fetch venue schedule
+   */
+  @http({
+    cacheSeconds: 180 * 60, parameters: [
+      {name: 'venueId', type: 'string', description: 'Venue ID to fetch schedule for'}
+    ]
+  })
+  async fetchVenueSchedule(venueId: string): Promise<HTTPObj> {
+    const endDate = formatInTimezone(addDays(new Date(), 190), this.timezone, 'date');
+
+    return {
+      method: 'GET',
+      url: `${this.baseURL}/venues/${venueId}/hours`,
+      queryParams: {
+        endDate: endDate,
+      },
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /**
+   * Get venue schedule (cached)
+   */
+  @cache({ttlSeconds: 60 * 60 * 3})
+  async getVenueSchedule(venueId: string): Promise<UniversalScheduleResponse> {
+    const resp = await this.fetchVenueSchedule(venueId);
+    return await resp.json();
+  }
+
+  /**
+   * Is the park behind `legacyVenueId` open right now — inside today's
+   * EXTRA_HOURS or OPERATING window per the legacy schedule endpoint?
+   *
+   * OpenTimeString/CloseTimeString/EarlyEntryString all carry a real UTC
+   * offset (the API stamps everything Eastern, even for Hollywood — see
+   * buildSchedules), so `new Date(...)` gives a directly comparable instant
+   * with no re-projection needed. Scanning every returned day rather than
+   * matching on the `Date` field sidesteps any day-boundary ambiguity
+   * around midnight.
+   *
+   * Returns true (ungated) whenever the schedule can't be trusted — a
+   * rejected fetch, a non-array response, or an array where not one single
+   * day parses into a usable window (empty array, every day malformed).
+   * Those are indistinguishable from an upstream glitch and must not
+   * silently start marking every show CLOSED. Only a response containing at
+   * least one genuinely parseable day, with none of them covering `now`,
+   * counts as a confirmed "the park is shut" — that is the ordinary,
+   * expected overnight case.
+   *
+   * `SpecialEntryUnix` remains unused: live HHN validation confirmed it is
+   * still zero while the ticketed event is running. Ticketed-event shows are
+   * gated separately against the official event calendar in buildLiveData.
+   */
+  async isParkOperatingNow(legacyVenueId: string, now: Date): Promise<boolean> {
+    return (await this.resolveParkDay(legacyVenueId, now)).operating;
+  }
+
+  /**
+   * The venue's relevant-day window, alongside the operating verdict.
+   *
+   * Same scan as isParkOperatingNow — deliberately one code path, because the
+   * two answers must never disagree about which day's row is "today". The
+   * window is what bounds the imminent-performance rule: a slot is only
+   * allowed to override the clock NEAR a real operating session, not floating
+   * free in the night. `window` is null whenever the verdict is fail-open,
+   * since there is then no trustworthy boundary to anchor to.
+   */
+  protected async resolveParkDay(
+    legacyVenueId: string,
+    now: Date,
+  ): Promise<{operating: boolean; window: {opensAt: number; closesAt: number} | null}> {
+    try {
+      const schedule = await this.getVenueSchedule(legacyVenueId);
+      if (!Array.isArray(schedule)) {
+        console.warn(`Universal: venue schedule for ${legacyVenueId} was not an array, unable to clock-gate shows`);
+        return {operating: true, window: null};
+      }
+
+      const nowMs = now.getTime();
+      // The legacy server keys Hollywood rows to Eastern dates even though
+      // their windows represent Pacific wall-clock hours. A malformed row on
+      // either plausible "today" must make the result unknown/fail-open;
+      // otherwise a valid row weeks later would incorrectly turn a partial
+      // response into a confident CLOSED.
+      const relevantDates = new Set([
+        formatDate(now, this.timezone),
+        formatDate(now, 'America/New_York'),
+      ]);
+
+      // A relevant day we could make a confident call on — either a real
+      // open/close window, or an explicit "Closed" (e.g. Volcano Bay's
+      // off-season). A parseable row for a different date does not establish
+      // that the upstream response included today's hours.
+      let sawValidRelevantDay = false;
+      let sawMalformedRelevantDay = false;
+      let relevantWindow: {opensAt: number; closesAt: number} | null = null;
+      let relevantWindowDistance = Number.POSITIVE_INFINITY;
+      for (const day of schedule) {
+        if (!day) continue;
+        const isRelevant = typeof day.Date === 'string' && relevantDates.has(day.Date);
+        if (day.VenueStatus === 'Closed') {
+          if (isRelevant) sawValidRelevantDay = true;
+          continue;
+        }
+        const regularOpenMs = new Date(day.OpenTimeString || NaN).getTime();
+        const earlyOpenMs = new Date(day.EarlyEntryString || NaN).getTime();
+        const closeMs = new Date(day.CloseTimeString || NaN).getTime();
+        if (!Number.isFinite(regularOpenMs)
+            || !Number.isFinite(closeMs)
+            || closeMs <= regularOpenMs) {
+          if (isRelevant) sawMalformedRelevantDay = true;
+          continue;
+        }
+        // Early entry only extends the normal opening window; a malformed or
+        // later value falls back to the valid general-admission opening.
+        const openMs = Number.isFinite(earlyOpenMs) && earlyOpenMs < regularOpenMs
+          ? earlyOpenMs
+          : regularOpenMs;
+        if (isRelevant) {
+          sawValidRelevantDay = true;
+          // Keep the relevant day's boundaries even when `now` sits outside
+          // them — that is precisely the case the grace window is for. Keep
+          // the NEAREST such day rather than the last one seen: Hollywood has
+          // two relevant dates (its own and the Eastern one the server keys
+          // rows to), so between 21:00 and midnight Pacific the Eastern date
+          // has already rolled over and a last-one-wins rule silently adopts
+          // TOMORROW's window. That direction is safe — it only ever declines
+          // to rescue a late show, never invents one — but it makes the
+          // result depend on the upstream array's ordering, which is not a
+          // property worth relying on.
+          const distance = nowMs < openMs ? openMs - nowMs
+            : nowMs > closeMs ? nowMs - closeMs
+            : 0;
+          if (relevantWindow === null || distance < relevantWindowDistance) {
+            relevantWindow = {opensAt: openMs, closesAt: closeMs};
+            relevantWindowDistance = distance;
+          }
+        }
+        if (nowMs >= openMs && nowMs <= closeMs) {
+          return {operating: true, window: {opensAt: openMs, closesAt: closeMs}};
+        }
+      }
+
+      if (sawMalformedRelevantDay) {
+        console.warn(
+          `Universal: venue schedule for ${legacyVenueId} had no usable window for the current day, unable to clock-gate shows`,
+        );
+        return {operating: true, window: null};
+      }
+      if (!sawValidRelevantDay) {
+        console.warn(`Universal: venue schedule for ${legacyVenueId} had no usable current day, unable to clock-gate shows`);
+        return {operating: true, window: null};
+      }
+      return {operating: false, window: relevantWindow};
+    } catch (err: any) {
+      console.warn(
+        `Universal: venue schedule unavailable for ${legacyVenueId}, unable to clock-gate shows: ${err?.message ?? err}`,
+      );
+      return {operating: true, window: null};
+    }
+  }
+
+  /**
+   * Get destination entity
+   */
+  async getDestinations(): Promise<Entity[]> {
+    return [
+      {
+        id: `universalresort_${this.city}`,
+        name: this.resortName,
+        entityType: 'DESTINATION',
+        timezone: this.timezone,
+        location: this.resortLocation,
+      } as Entity
+    ];
+  }
+
+  /**
+   * Build entities (destination, parks, attractions/shows/restaurants) from
+   * the UDX /resort-areas/{resortKey}/places endpoint. CityWalk and the
+   * Hollywood Upper/Lower Lot Park-type entries are filtered via the
+   * PARK_PLACE_ID_TO_LEGACY_VENUE_ID allow-list. Non-park entities are
+   * mapped through placeToEntity which drops anything outside Ride / Show /
+   * Dining (Shop / Amenity / Hotel / etc. are out of scope for this
+   * migration).
+   *
+   * Note: parkId and destinationId are automatically resolved by the base class.
+   */
+  protected async buildEntityList(): Promise<Entity[]> {
+    const destinationId = `universalresort_${this.city}`;
+    const places = await this.getPlaces();
+    const out: Entity[] = [...await this.getDestinations()];
+
+    // Parks first — they need to exist before non-park entities reference
+    // them via parentId. The new feed marks CityWalk and Hollywood's
+    // Upper/Lower Lots as `Park`, but we only surface "real" theme parks —
+    // filter against PARK_PLACE_ID_TO_LEGACY_VENUE_ID's keys.
+    for (const place of places) {
+      if (place.place_type.type !== 'Park') continue;
+      if (!(place.place_id in PARK_PLACE_ID_TO_LEGACY_VENUE_ID)) continue;
+      const park: Entity = {
+        id: sanitizeId(place.place_id),
+        name: place.name,
+        entityType: 'PARK',
+        parentId: destinationId,
+        destinationId,
+        timezone: this.timezone,
+      } as Entity;
+      // Park location: prefer `map`, fall back to any geometry entry (USH's
+      // `ush.ush` umbrella has only a GEOFENCE entry — the test harness
+      // (src/testRunner.ts) treats anchor entities without a location as a
+      // failure, so prefer-map-else-first beats dropping coords entirely).
+      const parkLoc =
+        place.geometry?.locations?.find((l) => l.location_type === 'map') ??
+        place.geometry?.locations?.find((l) => !!l.lat_lng);
+      if (parkLoc?.lat_lng) {
+        park.location = {latitude: parkLoc.lat_lng.lat, longitude: parkLoc.lat_lng.lng};
+      }
+      out.push(park);
+    }
+
+    // Non-park entities (rides, shows, restaurants). Drop event-flagged variants
+    // that alias a DIFFERENT existing place (Studio Tour language/last-tram,
+    // Hogwarts Express first/last train) — checked against the full place set so
+    // a share link to a non-existent id (sloppy feed data) is NOT treated as a
+    // variant.
+    const knownPlaceIds = new Set(places.map((p) => sanitizeId(p.place_id)));
+    const canonicalNames = canonicalPlaceNames(places, destinationId, this.timezone);
+    for (const place of places) {
+      if (isEventVariantAlias(place, knownPlaceIds)) continue;
+      // Second, independent signal for the same class: the share link is
+      // wrong on the very records it is meant to resolve (see
+      // isNamedEventVariant), so the name has to carry it too.
+      if (isNamedEventVariant(place, canonicalNames)) continue;
+      // An express queue is a queue on its maze, not an attraction of its
+      // own — buildLiveData reattaches its wait as PAID_STANDBY.
+      if (isExpressQueueVariant(place)) continue;
+      // An accessibility return time is a service on its house, not an
+      // attraction. Dropped only when the house itself is in the feed.
+      if (isAccessibilityReturnTimeVariant(place, knownPlaceIds)) continue;
+      // Passholder marketing copy typed as a ride/show/dining place.
+      if (isNonPoiNamespace(place)) continue;
+      const entity = placeToEntity(place, destinationId, this.timezone);
+      if (entity) out.push(entity);
+    }
+
+    return out;
+  }
+
+  /**
+   * Build live data for all entities
+   */
+  protected async buildLiveData(): Promise<LiveData[]> {
+    const liveData: LiveData[] = [];
+    const liveDataMap = new Map<string, LiveData>();
+
+    const getOrCreateLiveData = (id: string): LiveData => {
+      let data = liveDataMap.get(id);
+      if (!data) {
+        data = {
+          id: id,
+          status: 'CLOSED',
+        };
+        liveDataMap.set(id, data);
+        liveData.push(data);
+      }
+      return data;
+    };
+
+    const waitTimes = await this.getWaitTimes();
+    const vQueueStates = await this.getVirtualQueueStates();
+    const showList = await this.getShowList();
+    // Express-queue POIs -> the maze each one belongs to. Their wait is the
+    // express line's, so it is folded onto the maze as PAID_STANDBY rather
+    // than published as a second attraction's STANDBY (see
+    // buildExpressVariantMap). Empty for resorts without the pattern, which
+    // today is everyone except Hollywood.
+    //
+    // Isolated: getPlaces is the entity feed, and a failure there must not
+    // take the whole live build down with it — buildEntityList is the place
+    // that is allowed to fail loudly. Degrading to an empty map costs the
+    // express waits for one cycle and nothing else. In practice it is warm,
+    // since buildEntityList fetches the same @cache'd list every cycle.
+    let expressVariants = new Map<string, string>();
+    try {
+      expressVariants = buildExpressVariantMap(await this.getPlaces());
+    } catch (err: any) {
+      console.warn(
+        `Universal: place list unavailable, express waits will be absent this cycle: ${err?.message ?? err}`,
+      );
+    }
+
+    // Process virtual queues
+    for (const vQueue of vQueueStates) {
+      if (vQueue.IsEnabled) {
+        // Post-migration, entity IDs are sanitized place_ids. The VQ feed
+        // carries a PlaceId that matches that scheme; the legacy numeric
+        // QueueEntityId no longer maps to any emitted entity, so attaching
+        // RETURN_TIME by QueueEntityId would silently orphan the data.
+        // Skip VQ states without a PlaceId rather than attaching to a
+        // phantom id.
+        if (!vQueue.PlaceId) continue;
+
+        const vQueueDetails = await this.getVirtualQueueDetails(vQueue.Id);
+
+        // Find earliest appointment time
+        const nextSlot = vQueueDetails.AppointmentTimes.reduce<{
+          startTime: Date;
+          endTime: Date;
+        } | undefined>((prev, appt) => {
+          const startTime = new Date(appt.StartTime);
+          if (!prev || isBefore(startTime, prev.startTime)) {
+            return {
+              startTime,
+              endTime: new Date(appt.EndTime),
+            };
+          }
+          return prev;
+        }, undefined);
+
+        const liveDataEntry = getOrCreateLiveData(sanitizeId(vQueue.PlaceId));
+        if (!liveDataEntry.queue) {
+          liveDataEntry.queue = {} as Record<QueueTypeEnum, any>;
+        }
+
+        liveDataEntry.queue!.RETURN_TIME = {
+          returnStart: nextSlot ? parseTimeInTimezone(nextSlot.startTime.toISOString(), this.timezone) : null,
+          returnEnd: nextSlot ? parseTimeInTimezone(nextSlot.endTime.toISOString(), this.timezone) : null,
+          state: nextSlot ? 'AVAILABLE' : 'TEMP_FULL',
+        };
+      }
+    }
+
+    // Process wait times
+    for (const attraction of waitTimes) {
+      if (!attraction || !attraction.queues) continue;
+
+      let attractionLiveData: LiveData | null = null;
+      let hasOperatingQueue = false;
+      let isBrokenDown = false;
+
+      for (const queue of attraction.queues) {
+        let rideId: string | null = null;
+
+        if (attraction.wait_time_attraction_id) {
+          rideId = sanitizeId(attraction.wait_time_attraction_id);
+        }
+
+        if (!rideId) continue;
+
+        // An express-queue POI carries the maze's express wait in its own
+        // STANDBY queue. Fold it onto the maze and emit no row of its own —
+        // the entity no longer exists. Only the number moves: the maze's
+        // status comes from the maze's own queues, never from the state of
+        // its express line.
+        const expressTarget = expressVariants.get(rideId);
+        if (expressTarget) {
+          if (queue.queue_type !== 'STANDBY') continue;
+          if (queue.status !== 'OPEN' && queue.status !== 'RIDE_NOW') continue;
+          // `?? undefined` because a null reading must be treated as absent,
+          // not published as PAID_STANDBY:null — that is byte-identical to the
+          // EXPRESS branch's "sold, wait unknown" and no consumer could tell
+          // the two provenances apart.
+          const raw = queue.display_wait_time ?? undefined;
+          // 995 is Universal's "not available" sentinel; RIDE_NOW with no
+          // reading is a walk-on, matching the STANDBY branch below.
+          const waitTime = queue.status === 'RIDE_NOW' && raw === undefined ? 0 : raw;
+          if (waitTime === undefined || waitTime === 995) continue;
+          const target = getOrCreateLiveData(expressTarget);
+          if (!target.queue) {
+            target.queue = {};
+          }
+          target.queue.PAID_STANDBY = {waitTime};
+          continue;
+        }
+
+        if (!attractionLiveData) {
+          attractionLiveData = getOrCreateLiveData(rideId);
+        }
+
+        switch (queue.queue_type) {
+          case 'STANDBY':
+            if (queue.status === 'OPEN' || queue.status === 'RIDE_NOW') {
+              let waitTime = queue.display_wait_time ?? undefined;
+              if (waitTime === undefined && queue.status === 'RIDE_NOW') {
+                waitTime = 0;
+              }
+
+              if (!attractionLiveData.queue) {
+                attractionLiveData.queue = {};
+              }
+              attractionLiveData.queue.STANDBY = {waitTime};
+              hasOperatingQueue = true;
+            }
+
+            if (queue.status === 'BRIEF_DELAY' || queue.status === 'WEATHER_DELAY') {
+              isBrokenDown = true;
+            }
+
+            if (queue.status === 'OPENS_AT' && queue.opens_at) {
+              if (!attractionLiveData.operatingHours) {
+                attractionLiveData.operatingHours = [];
+              }
+              attractionLiveData.operatingHours.push({
+                type: 'OPERATING',
+                startTime: queue.opens_at,
+                endTime: null,
+              });
+            }
+
+            if (queue.status === 'EXTENDED_CLOSURE' || queue.status === 'COMING_SOON') {
+              attractionLiveData.status = 'CLOSED';
+            }
+
+            if (queue.status === 'AT_CAPACITY') {
+              attractionLiveData.status = 'DOWN';
+            }
+            break;
+
+          case 'SINGLE':
+            if (attraction.has_single_rider && queue.status === 'OPEN') {
+              if (!attractionLiveData.queue) {
+                attractionLiveData.queue = {};
+              }
+              attractionLiveData.queue.SINGLE_RIDER = {waitTime: null};
+              hasOperatingQueue = true;
+            }
+            break;
+
+          case 'EXPRESS':
+            // Express Pass — status field unreliable (always CLOSED).
+            // display_wait_time !== 995 means Express is available.
+            // 995 is Universal's "not available" sentinel.
+            // Wait time values are unreliable, report null.
+            if (queue.display_wait_time !== undefined && queue.display_wait_time !== 995) {
+              if (!attractionLiveData.queue) {
+                attractionLiveData.queue = {};
+              }
+              // Never clobber a real number with null. The express-variant
+              // fold writes an actual reading into this same slot, and which
+              // of the two ran last is decided by the wait feed's ordering —
+              // it is sorted by place_id, and an express twin's id carries no
+              // `hhn_YYYY_` prefix, so it sorts BEFORE its maze for any maze
+              // whose name starts before "h". That silently nulled four of
+              // Hollywood's eight folded waits the moment a maze row carried
+              // an EXPRESS queue, which every Orlando house already does.
+              // A known wait always beats "available, wait unknown".
+              const existing: any = attractionLiveData.queue.PAID_STANDBY;
+              if (existing?.waitTime === undefined || existing.waitTime === null) {
+                attractionLiveData.queue.PAID_STANDBY = {waitTime: null};
+              }
+            }
+            break;
+        }
+      }
+
+      if (attractionLiveData) {
+        if (isBrokenDown) {
+          attractionLiveData.status = 'DOWN';
+        } else if (hasOperatingQueue) {
+          attractionLiveData.status = 'OPERATING';
+        } else {
+          attractionLiveData.status = 'CLOSED';
+        }
+      }
+    }
+
+    // Process show times from the CDN show-list.json (place_id-keyed).
+    //
+    // Whether each surfaced park is open right now, keyed by sanitized place
+    // id (e.g. 'ush.ush'). Computed once per cycle and shared across every
+    // show at that venue — clock-gates the "has future showtimes" default in
+    // mapUniversalShowStatus so a show doesn't read OPERATING straight
+    // through an overnight closure just because today's slot list is never
+    // empty (see mapUniversalShowStatus doc comment).
+    const now = new Date();
+    const parkOperatingByVenue = new Map<string, boolean>();
+    // The same lookup also yields each venue's day boundaries, which bound the
+    // imminent-performance rule below.
+    const parkWindowByVenue = new Map<string, {opensAt: number; closesAt: number} | null>();
+    await Promise.all(
+      Object.entries(PARK_PLACE_ID_TO_LEGACY_VENUE_ID)
+        .filter(([placeId]) => placeId.startsWith(`${this.resortKey}.`))
+        .map(async ([placeId, legacyVenueId]) => {
+          const day = await this.resolveParkDay(legacyVenueId, now);
+          parkOperatingByVenue.set(sanitizeId(placeId), day.operating);
+          parkWindowByVenue.set(sanitizeId(placeId), day.window);
+        }),
+    );
+
+    // HHN shows are present only around the event season and carry a stable
+    // `category: "hhn"` marker. Their park is deliberately closed to daytime
+    // guests while they run, so applying the day-park gate would force a live
+    // event show CLOSED. Fetch the official ticketed-event calendar only when
+    // such a show is actually present. A missing/broken calendar is unknown,
+    // not proof of closure, and therefore fails open for event shows only.
+    const hasTicketedEventShows = showList.some(
+      (show) => show.category?.toLowerCase() === 'hhn',
+    );
+    let eventOperating: boolean | null = null;
+    // When the event is running, the instant it closes. An ordinary show is
+    // only ungated by the event if it actually performs before then.
+    let eventWindowClosesAt: number | null = null;
+    let eventWindow: {opensAt: number; closesAt: number} | null = null;
+    if (hasTicketedEventShows) {
+      try {
+        const eventNights = await this.getEventNights();
+        if (eventNights.length > 0) {
+          const window = universalEventWindowAt(eventNights, now, this.timezone);
+          eventWindow = window ?? null;
+          eventWindowClosesAt = window?.closesAt ?? null;
+          eventOperating = window === undefined ? null : window !== null;
+          if (eventOperating === null) {
+            console.warn('Universal: event calendar had a malformed window; leaving event shows ungated');
+          }
+        } else {
+          console.warn(
+            'Universal: event shows are present but no event calendar was available; leaving them ungated',
+          );
+        }
+      } catch (err: any) {
+        console.warn(
+          `Universal: event calendar unavailable while event shows are present; leaving them ungated: ${err?.message ?? err}`,
+        );
+      }
+    }
+    const eventScheduleVenue = this.eventCalendarPlaceId
+      ? sanitizeId(this.eventCalendarPlaceId)
+      : null;
+
+    for (const show of showList) {
+      if (!show.show_externally) continue;
+      const showId = sanitizeId(show.show_id);
+      const showEntry = getOrCreateLiveData(showId);
+
+      const times = parseShowTimes(show, this.timezone, now);
+      const scheduleVenue = resolveScheduleVenue(show.venue_id);
+      // No resolvable venue (CityWalk, or a missing/unrecognised venue_id) ->
+      // hours unknown -> don't gate, same as a failed schedule lookup.
+      let parkOperating = scheduleVenue
+        ? (parkOperatingByVenue.get(scheduleVenue) ?? true)
+        : true;
+      if (show.category?.toLowerCase() === 'hhn') {
+        // A known calendar can make a confident event-window decision only
+        // for the configured host park. Any configuration/venue mismatch is
+        // hours-unknown and deliberately retains the feed's old behaviour.
+        parkOperating = eventOperating !== null
+          && eventScheduleVenue !== null
+          && scheduleVenue === eventScheduleVenue
+          ? eventOperating
+          : true;
+      } else if (
+        !parkOperating
+        && eventOperating === true
+        && eventWindowClosesAt !== null
+        && eventScheduleVenue !== null
+        && scheduleVenue === eventScheduleVenue
+        && times.some((t) => Date.parse(t.startTime) <= eventWindowClosesAt!)
+      ) {
+        // The park is SHUT to day guests but the ticketed event is running,
+        // and this ordinary show performs INSIDE it. Super Nintendo World
+        // stays open through Halloween Horror Nights: "Meet Mario and Luigi",
+        // "Meet Toad" and "Meet Princess Peach" carry ENABLED performances at
+        // 19:00-21:30 while Hollywood's day park closed at 18:00, and they are
+        // categorised `general`, not `hhn`. Gating those on day-park hours
+        // alone republishes exactly the contradiction this gate was built to
+        // remove — CLOSED beside a showtime happening right now — from the
+        // other side of the clock.
+        //
+        // The performance test is what keeps the original fix intact. A show
+        // whose only remaining slot is tomorrow MORNING is not performing in
+        // tonight's event, and must stay CLOSED however long the event runs —
+        // that is the overnight-staleness case #321 was built for, and a bare
+        // "the event is on" check would have undone it. Only a slot at or
+        // before the event's close counts.
+        parkOperating = true;
+      }
+      // A performance that has ALREADY BEGUN outranks the published hours,
+      // within the current operating session. Both published windows are
+      // incomplete in ways the feed keeps finding — Epic Universe's closing
+      // spectacular performs after the park's posted close, HHN early access
+      // admits guests before the ticketed-event window opens — and a show
+      // demonstrably on stage settles it better than either.
+      //
+      // Two limits, each learned from a regression this rule caused:
+      //  - Backward-looking only. A future slot is a prediction, and this
+      //    feed's predictions carry phantoms (see PERFORMANCE_UNDERWAY_MS).
+      //  - Anchored to a session. Unanchored, one mis-stamped 02:30 slot
+      //    published a show OPERATING all through the night (see
+      //    POST_CLOSE_GRACE_MS), so the rule reaches from the day's opening
+      //    to an hour past its close, or across the ticketed event while it
+      //    actually runs, and nowhere else. Outside that the clock wins,
+      //    which is the overnight case this gate was built for.
+      // The intervals in which a performance is allowed to override the
+      // clock. Both the instant and the slot must fall inside one.
+      const dayWindow = scheduleVenue ? parkWindowByVenue.get(scheduleVenue) ?? null : null;
+      const bounds: Array<{start: number; end: number}> = [];
+      if (dayWindow !== null) {
+        bounds.push({start: dayWindow.opensAt, end: dayWindow.closesAt + POST_CLOSE_GRACE_MS});
+      }
+      // Scoped to the host venue, exactly as the hhn branch above is. Without
+      // that scope a single hhn show anywhere in the feed opened this rule at
+      // EVERY venue for the whole event night — an Epic Universe show with a
+      // 23:30 slot read OPERATING three and a half hours past Epic's close
+      // because Halloween Horror Nights was running at Universal Studios
+      // Florida.
+      if (eventWindow !== null && eventScheduleVenue !== null && scheduleVenue === eventScheduleVenue) {
+        bounds.push({start: eventWindow.opensAt, end: eventWindow.closesAt});
+      }
+      // A schedule we could not read leaves no interval to anchor to, so the
+      // rule simply does not apply — note this is NOT moot just because the
+      // fail-open path also sets parkOperating true: the default branch is
+      // `(hasFutureShowtimes && parkOperating) || performingNow`, and a show
+      // already on stage has no future showtimes at all.
+      if (parkOperating && dayWindow === null) {
+        bounds.push({
+          start: now.getTime() - PERFORMANCE_UNDERWAY_MS,
+          end: now.getTime(),
+        });
+      }
+      showEntry.status = mapUniversalShowStatus(
+        show.status,
+        times.length > 0,
+        parkOperating,
+        hasPerformanceUnderway(show, now, bounds),
+      );
+      if (times.length > 0) {
+        showEntry.showtimes = times;
+      }
+    }
+
+    // Layer Express Now (paid return time) offers from the UDX API. Only
+    // attached to attractions that already appear in the live-data map —
+    // a paid return-time without a known ride is not actionable downstream.
+    let expressNowOffers: Record<string, ExpressNowOffer> = {};
+    try {
+      expressNowOffers = await this.getExpressNowOffers();
+    } catch (err: any) {
+      console.warn('Universal: Express Now offers fetch failed:', String(err?.message ?? err).split('\n')[0]);
+    }
+    for (const [placeId, offer] of Object.entries(expressNowOffers)) {
+      if (offer.vl_inventory <= 0) continue;
+
+      const sanitizedPlaceId = sanitizeId(placeId);
+      const entry = liveDataMap.get(sanitizedPlaceId);
+      if (!entry) continue;
+
+      // Defensive: parseExpressNowResponse already validates the slot
+      // format, so this should never throw — but if `parseTimeInTimezone`
+      // ever surprises us on a future format change, skip just this offer
+      // rather than bringing down buildLiveData for the whole destination.
+      let startDate: Date;
+      let endDate: Date;
+      try {
+        startDate = new Date(parseTimeInTimezone(offer.inventory_time_slot, this.timezone));
+        endDate = addMinutes(startDate, offer.inventory_time_minutes);
+        if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+          throw new Error('invalid date');
+        }
+      } catch (err: any) {
+        console.warn(
+          `Universal: skipping Express Now offer for ${placeId} — bad time slot ${offer.inventory_time_slot}: ${err?.message ?? err}`,
+        );
+        continue;
+      }
+
+      if (!entry.queue) entry.queue = {};
+      entry.queue.PAID_RETURN_TIME = this.buildPaidReturnTimeQueue(
+        'AVAILABLE',
+        startDate,
+        endDate,
+        'USD',
+        Math.round(offer.product_price * 100), // dollars → cents
+      );
+    }
+
+    return await this.dropUnpublishableRows(liveData);
+  }
+
+  /**
+   * Keep only rows whose entity this destination actually publishes.
+   *
+   * The live feeds and the place feed do not agree on what exists. show-list
+   * and the wait-time feed emit readings for things buildEntityList has no
+   * entity for, in four separate ways seen live at Hollywood:
+   *
+   *  - ids the PLACE feed has never heard of (`ush.mms.minion.dance.party`,
+   *    and `ush.upper.lot.shows.meet_james.henry`, which is dotted where every
+   *    other id is underscored — an older id shape leaking in);
+   *  - event-variant aliases dropped as duplicates (Studio Tour Last Tram, and
+   *    the Mandarin/Spanish variants whose share links point at WaterWorld);
+   *  - children of a venue with no wiki representation (CityWalk);
+   *  - places whose type placeToEntity does not map (an `Events`-typed ride).
+   *
+   * A row keyed to an entity that is never emitted cannot be resolved by any
+   * consumer — it is dropped downstream after being built, pushed and logged.
+   * Filtering here costs one already-cached place list and removes the whole
+   * class rather than the four causes one at a time.
+   *
+   * Derived from buildEntityList itself rather than by re-testing the same
+   * predicates, so the two cannot drift apart as feed shapes are added.
+   *
+   * ISOLATED on purpose: buildEntityList is allowed to fail loudly, but a
+   * failure here must not blank a whole cycle of wait times. If the entity
+   * list cannot be built, every row is published exactly as before.
+   */
+  protected async dropUnpublishableRows(rows: LiveData[]): Promise<LiveData[]> {
+    let publishable: Set<string>;
+    try {
+      publishable = new Set((await this.buildEntityList()).map((e) => e.id));
+    } catch (err: any) {
+      console.warn(
+        `[${this.constructor.name}] entity list unavailable, publishing every live row: ${err?.message ?? err}`,
+      );
+      return rows;
+    }
+    const kept = rows.filter((row) => publishable.has(row.id));
+    const dropped = rows.length - kept.length;
+
+    // A filter that would remove most of the feed is evidence its INPUT is
+    // wrong, not that the rows are. getPlaces coerces any malformed-but-200
+    // response to [] and @caches it for twelve hours, which yields an entity
+    // list holding little more than the destination itself — and would then
+    // silently blank every wait time for half a day. The orphans this exists
+    // to remove are a fraction of a feed (10 of 57 at Hollywood, 0 of 94 at
+    // Orlando); anything near-total is an outage wearing a filter's clothes.
+    // Publish everything and say so, rather than mistaking one for the other.
+    if (dropped > rows.length / 2) {
+      console.warn(
+        `[${this.constructor.name}] entity list would drop ${dropped}/${rows.length} live rows — treating it as unusable and publishing every row`,
+      );
+      return rows;
+    }
+
+    if (dropped > 0) {
+      console.warn(
+        `[${this.constructor.name}] dropped ${dropped} live row(s) keyed to entities that are never published`,
+      );
+    }
+    return kept;
+  }
+
+  /**
+   * Build schedules for all parks
+   */
+  protected async buildSchedules(): Promise<EntitySchedule[]> {
+    const schedules: EntitySchedule[] = [];
+    // Isolated: a website change must not take the day-park hours down with it.
+    const eventNights = await this.getEventNights().catch(err => {
+      console.warn(`[${this.constructor.name}] event calendar unavailable:`, err);
+      return [] as UniversalEventNight[];
+    });
+
+    // Iterate the place_id ↔ legacy VenueId map filtered to this resort.
+    // The legacy schedule endpoint still wants the numeric VenueId; we only
+    // relabel the emitted EntitySchedule with the new place_id so it joins
+    // up with the park entities from buildEntityList.
+    const parkPlaceIds = new Set(this.parkPlaceIds());
+    const parkEntries = Object.entries(PARK_PLACE_ID_TO_LEGACY_VENUE_ID).filter(
+      ([placeId]) => parkPlaceIds.has(placeId),
+    );
+
+    for (const [placeId, legacyVenueId] of parkEntries) {
+      const venueSchedule = await this.getVenueSchedule(legacyVenueId);
+      const schedule = [];
+
+      for (const daySchedule of venueSchedule) {
+        if (daySchedule.VenueStatus === 'Closed') continue;
+        // UOR's real API omits Open/CloseTimeString on some days (e.g. an
+        // off-season closure) without necessarily setting VenueStatus —
+        // skip rather than publish an Invalid Date or inverted window.
+        if (!daySchedule.OpenTimeString || !daySchedule.CloseTimeString) continue;
+
+        const rawOpen = new Date(daySchedule.OpenTimeString);
+        const rawClose = new Date(daySchedule.CloseTimeString);
+        if (!Number.isFinite(rawOpen.getTime())
+            || !Number.isFinite(rawClose.getTime())
+            || rawClose <= rawOpen) {
+          console.warn(`[${this.constructor.name}] skipping malformed venue hours for ${placeId} on ${daySchedule.Date}`);
+          continue;
+        }
+        // The API server lives in Orlando and stamps every entry with the
+        // Eastern offset — including Hollywood venues. Re-project into the
+        // destination's own timezone so the wall clock matches the park.
+        const open = formatInTimezone(rawOpen, this.timezone, 'iso');
+        const close = formatInTimezone(rawClose, this.timezone, 'iso');
+
+        schedule.push({
+          date: daySchedule.Date,
+          openingTime: open,
+          closingTime: close,
+          type: 'OPERATING' as const,
+        });
+
+        const rawEarly = new Date(daySchedule.EarlyEntryString || NaN);
+        if (Number.isFinite(rawEarly.getTime()) && rawEarly < rawOpen) {
+          schedule.push({
+            date: daySchedule.Date,
+            openingTime: formatInTimezone(rawEarly, this.timezone, 'iso'),
+            closingTime: open,
+            type: 'EXTRA_HOURS' as const,
+          });
+        }
+      }
+
+      // Ticketed events (HHN) run after the day park shuts and are absent from
+      // the venue-hours API entirely — every day of the season comes back
+      // 09:00-17:00 with no event fields set. Without these the API shows
+      // attractions OPERATING hours after the park's published close.
+      if (placeId === this.eventCalendarPlaceId) {
+        for (const night of eventNights) {
+          try {
+            const openingTime = constructDateTime(night.date, night.openingTime, this.timezone);
+            const closingTime = constructDateTime(
+              night.closesNextDay ? shiftDateString(night.date, 1) : night.date,
+              night.closingTime,
+              this.timezone,
+            );
+            const openingMs = new Date(openingTime).getTime();
+            const closingMs = new Date(closingTime).getTime();
+            if (!Number.isFinite(openingMs) || !Number.isFinite(closingMs) || closingMs <= openingMs) {
+              console.warn(`[${this.constructor.name}] skipping malformed ticketed-event hours for ${placeId} on ${night.date}`);
+              continue;
+            }
+            schedule.push({
+              date: night.date,
+              openingTime,
+              closingTime,
+              type: 'TICKETED_EVENT' as const,
+              description: night.name,
+            });
+            // Early access as its OWN entry, not by widening the window above.
+            // The event genuinely starts when it advertises; early access is a
+            // separately sold perk, and folding it in would tell every
+            // consumer that general admission begins ninety minutes earlier
+            // than it does. INFO because it is an advertised admission time
+            // rather than the park's own operating hours.
+            //
+            // Its close is inferred from the event's opening — the calendar
+            // block carries a start and no end — so it is only emitted when
+            // that produces a real, forward window.
+            if (night.earlyAccessTime) {
+              try {
+                const earlyOpening = constructDateTime(night.date, night.earlyAccessTime, this.timezone);
+                const earlyMs = new Date(earlyOpening).getTime();
+                if (Number.isFinite(earlyMs) && earlyMs < openingMs) {
+                  schedule.push({
+                    date: night.date,
+                    openingTime: earlyOpening,
+                    closingTime: openingTime,
+                    type: 'INFO' as const,
+                    description: `${night.name} Early Access`,
+                  });
+                }
+              } catch {
+                console.warn(`[${this.constructor.name}] skipping malformed early-access hours for ${placeId} on ${night.date}`);
+              }
+            }
+          } catch {
+            console.warn(`[${this.constructor.name}] skipping malformed ticketed-event hours for ${placeId} on ${night.date}`);
+          }
+        }
+      }
+
+      schedules.push({
+        // sanitizeId for symmetry with the PARK entity emission in
+        // buildEntityList — today's allow-list keys are clean (`uor.usf`
+        // etc.), but if a future key needs sanitisation the schedule
+        // still has to join up with the matching PARK entity.
+        id: sanitizeId(placeId),
+        schedule,
+      });
+    }
+
+    return schedules;
+  }
+}
+
+/**
+ * Universal Studios Orlando
+ */
+/** One night of a ticketed event, resolved from the website's event calendar. */
+export interface UniversalEventNight {
+  /** YYYY-MM-DD in the park's own timezone. */
+  date: string;
+  /** Event name, e.g. "Halloween Horror Nights". */
+  name: string;
+  /** Opening time, HH:mm. */
+  openingTime: string;
+  /** Closing time, HH:mm. Past midnight belongs to the following date. */
+  closingTime: string;
+  /** True when the close falls on the day after `date`. */
+  closesNextDay: boolean;
+  /**
+   * Early admission, HH:mm, when the calendar advertises one — HHN sells
+   * early access ahead of the advertised event start.
+   *
+   * Kept separate from `openingTime` rather than folded into it: the event
+   * genuinely starts when it says it does, and widening the published window
+   * would tell every consumer that general admission begins ninety minutes
+   * early. It is published as its own INFO entry and used to decide whether
+   * guests are actually inside, which are two different questions.
+   */
+  earlyAccessTime?: string;
+}
+
+/**
+ * "6:30 PM - 2:00 AM". The separator is a hyphen in some CMS blocks and an
+ * en dash in others, in the same document, so both are accepted.
+ */
+const EVENT_HOURS = /(\d{1,2}):(\d{2})\s*(AM|PM)\s*[-–—]\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i;
+
+/**
+ * A LONE time with no range — "5:30pm" — which is how the calendar advertises
+ * early access.
+ *
+ * A date group carries up to three block shapes, and only these two patterns
+ * tell them apart:
+ *
+ *   heading='Halloween Horror Nights Early Access'  eyebrow='5:30pm'
+ *   heading='Halloween Horror Nights'               eyebrow='7:00 PM - 2:00 AM'
+ *   heading='No Event Today'                        eyebrow='Halloween Horror Nights'
+ *
+ * The parser previously required a RANGE and skipped everything else, which
+ * discarded early access and "No Event Today" alike — correct for the second,
+ * wrong for the first, and the reason an hhn-tagged show performing at 17:30
+ * was gated against a 19:00 window and published CLOSED while it ran.
+ *
+ * Anchored at both ends so it cannot match one half of a range.
+ */
+const EVENT_SINGLE_TIME = /^\s*(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\s*$/i;
+
+/** 12-hour clock to HH:mm. 12 AM is 00, 12 PM is 12. */
+function to24Hour(hour: string, minute: string, meridiem: string): string {
+  let h = Number(hour) % 12;
+  if (meridiem.toUpperCase() === 'PM') h += 12;
+  return `${String(h).padStart(2, '0')}:${minute}`;
+}
+
+/** Read the single `Values` entry off a Tridion field, if present. */
+function tridionValue(field: unknown): string | undefined {
+  const values = (field as {Values?: unknown[]} | undefined)?.Values;
+  return Array.isArray(values) && typeof values[0] === 'string' ? values[0] : undefined;
+}
+
+/**
+ * Parse the ticketed-event calendar out of the website's page payload.
+ *
+ * The payload is the Tridion CMS document behind the site's event-day
+ * calendar. It is served as `text/html` but is JSON throughout.
+ *
+ * Three things about the CMS authoring drive the shape of this function:
+ *
+ *  1. `heading` and `eyebrow` are used inconsistently between blocks. One
+ *     block puts the event name in `heading` and the hours in `eyebrow`; the
+ *     others do the reverse. Whichever field parses as a time range is the
+ *     hours, and the other is the name — position is never trusted.
+ *  2. A block with no time range in either field is not an event. That is how
+ *     the "No Event Today" block, which lists the nights the event does NOT
+ *     run, is excluded rather than published as a night that it is closed.
+ *  3. A date group can contain multiple blocks. Hollywood puts an early-access
+ *     marker first and the bounded event window second, so every block is read.
+ *
+ * `eventDates` carries authoring timestamps (`2026-08-27T14:36:10`) whose time
+ * component is meaningless, so only the date part is read.
+ */
+export function parseUniversalEventCalendar(payload: unknown): UniversalEventNight[] {
+  const presentations = (payload as {ComponentPresentations?: unknown[]})?.ComponentPresentations;
+  if (!Array.isArray(presentations)) return [];
+
+  const calendar = presentations.find(entry =>
+    (entry as any)?.Component?.Schema?.RootElementName === 'GDSCalendar');
+  if (!calendar) return [];
+
+  const configs = (calendar as any)?.Component?.Fields?.calendarData
+    ?.LinkedComponentValues?.[0]?.Fields?.calendarConfig?.EmbeddedValues;
+  if (!Array.isArray(configs)) return [];
+
+  const nights: UniversalEventNight[] = [];
+  const seen = new Set<string>();
+
+  for (const entry of configs) {
+    const dates = entry?.eventDates?.DateTimeValues;
+    if (!Array.isArray(dates)) continue;
+
+    // Orlando currently has one block per date group. Hollywood puts an
+    // unbounded "Early Access — 5:30pm" block first and the actual
+    // "7:00 PM - 2:00 AM" event window second, so every linked block must be
+    // inspected rather than assuming index zero carries the event hours.
+    const blocks = entry?.blockData?.LinkedComponentValues?.[0]?.Fields
+      ?.blocksData?.LinkedComponentValues;
+    if (!Array.isArray(blocks)) continue;
+
+    // Early access is advertised in its own block, as a lone time, and applies
+    // to every date in the group. Read it first so the event block below can
+    // carry it — the calendar puts early access FIRST and the real window
+    // second, but do not rely on that ordering.
+    let earlyAccessTime: string | undefined;
+    for (const block of blocks) {
+      const fields = block?.Fields;
+      const labels = [tridionValue(fields?.heading), tridionValue(fields?.eyebrow)]
+        .filter((text): text is string => !!text);
+      // Skip anything carrying a RANGE — that is the event block itself.
+      if (labels.some((text) => EVENT_HOURS.test(text))) continue;
+      const lone = labels
+        .map((text) => text.match(EVENT_SINGLE_TIME))
+        .find((match) => match !== null);
+      if (lone) earlyAccessTime = to24Hour(lone[1], lone[2] ?? '00', lone[3]);
+    }
+
+    for (const block of blocks) {
+      const fields = block?.Fields;
+      const heading = tridionValue(fields?.heading);
+      const eyebrow = tridionValue(fields?.eyebrow);
+
+      // Match once and carry the result, rather than testing with one call and
+      // re-matching with a non-null assertion in another. The assertion would
+      // be correct today and silently wrong the first time the predicate drifts.
+      const labels = [heading, eyebrow].filter((text): text is string => !!text);
+      const hours = labels
+        .map(text => ({text, match: text.match(EVENT_HOURS)}))
+        .find(candidate => candidate.match !== null);
+      if (!hours?.match) continue;
+      const name = labels.find(text => text !== hours.text);
+      if (!name) continue;
+
+      const [, openHour, openMinute, openMeridiem, closeHour, closeMinute, closeMeridiem] =
+        hours.match;
+      const openingTime = to24Hour(openHour, openMinute, openMeridiem);
+      const closingTime = to24Hour(closeHour, closeMinute, closeMeridiem);
+
+      for (const value of dates) {
+        if (typeof value !== 'string') continue;
+        const date = value.slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+        // One night per date/name. Blocks do not overlap today, but a
+        // duplicate would otherwise publish the same event twice.
+        const key = `${date}:${name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        nights.push({
+          date,
+          name,
+          openingTime,
+          closingTime,
+          closesNextDay: closingTime <= openingTime,
+          // Only when it genuinely precedes the advertised start. A lone time
+          // at or after the opening is not early access, and a group with a
+          // lone time but no range never reaches here at all — the event block
+          // is what creates the night.
+          ...(earlyAccessTime !== undefined && earlyAccessTime < openingTime
+            ? {earlyAccessTime}
+            : {}),
+        });
+      }
+    }
+  }
+
+  nights.sort((a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name));
+  return nights;
+}
+
+@destinationController({category: 'Universal'})
+export class UniversalOrlando extends Universal {
+  resortLocation = {latitude: 28.4719, longitude: -81.4685};
+
+  constructor(options?: DestinationConstructor) {
+    super({
+      ...options,
+      config: {
+        city: 'orlando',
+        resortName: 'Universal Orlando Resort',
+        resortSlug: 'universalorlando',
+        resortKey: 'uor',
+        timezone: 'America/New_York',
+        parkLatitude: '28.4747',
+        parkLongitude: '-81.4682',
+        ...options?.config,
+      },
+    });
+  }
+}
+
+/**
+ * Universal Studios Hollywood
+ */
+@destinationController({category: 'Universal'})
+export class UniversalStudios extends Universal {
+  resortLocation = {latitude: 34.1381, longitude: -118.3534};
+
+  constructor(options?: DestinationConstructor) {
+    super({
+      ...options,
+      config: {
+        city: 'hollywood',
+        resortName: 'Universal Studios Hollywood',
+        resortSlug: 'universalstudios',
+        resortKey: 'ush',
+        timezone: 'America/Los_Angeles',
+        parkLatitude: '34.1381',
+        parkLongitude: '-118.3534',
+        // Hollywood's class name IS the shared legacy prefix
+        // ('UNIVERSALSTUDIOS'), so UNIVERSALSTUDIOS_EVENTCALENDAR* — which
+        // in practice configures Orlando — would otherwise be read here and
+        // point Hollywood at Orlando's microsite and host park. Neither the
+        // class-name nor the prefix env lookup can be scoped to one of the
+        // two resorts, so the value is resolved before config exists and
+        // placed in instance config, above every env lookup.
+        //
+        // That leaves nothing for an operator to turn when the microsite
+        // path moves, hence the Hollywood-scoped names read here: they are
+        // unambiguous, cannot collide with Orlando's, and keep a moved URL
+        // a config change rather than a release.
+        eventCalendarURL: process.env.UNIVERSALSTUDIOSHOLLYWOOD_EVENTCALENDARURL
+          || 'https://www.universalstudioshollywood.com/contentdata/ush/en/us/hhn/about/index.html',
+        eventCalendarPlaceId: process.env.UNIVERSALSTUDIOSHOLLYWOOD_EVENTCALENDARPLACEID
+          || 'ush.ush',
+        ...options?.config,
+      },
+    });
+  }
+}

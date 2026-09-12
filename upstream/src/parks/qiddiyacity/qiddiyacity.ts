@@ -1,0 +1,608 @@
+import {Destination, DestinationConstructor} from '../../destination.js';
+import {cache} from '../../cache.js';
+import {http, HTTPObj} from '../../http.js';
+import {inject} from '../../injector.js';
+import config from '../../config.js';
+import {destinationController} from '../../destinationRegistry.js';
+import {Entity, LiveData, EntitySchedule} from '@themeparks/typelib';
+import {constructDateTime, formatDate, hostnameFromUrl, addDays} from '../../datetime.js';
+import {TagBuilder} from '../../tags/index.js';
+
+// ─── API types ────────────────────────────────────────────────────────────────
+
+type QiddiyaLocation = {latitude: number; longitude: number};
+type QiddiyaLand = {code: string; label: string};
+
+type QiddiyaDayHours = {open: string; close: string};
+type QiddiyaWeekHours = Partial<Record<
+  'Monday' | 'Tuesday' | 'Wednesday' | 'Thursday' | 'Friday' | 'Saturday' | 'Sunday',
+  QiddiyaDayHours
+>>;
+
+type QiddiyaActivity = {
+  id: string;
+  name: string;
+  title: string;
+  category: 'RIDES' | 'DINING' | 'SHOPPING' | 'FACILITIES' | 'ENTERTAINMENT';
+  categoryTitle: string;
+  description?: string;
+  location?: QiddiyaLocation;
+  locationId?: string;
+  land?: QiddiyaLand;
+  hoursOfOperation?: QiddiyaWeekHours[];
+  goFastPass?: boolean;
+  minHeight?: number;
+  maxHeight?: number;
+  waitTime?: number | null;
+  mobileImageAttribute?: {externalPath?: string};
+  rideAttributes?: {
+    features?: Array<{code: string; label: string}>;
+  };
+};
+
+type QiddiyaActivitiesResponse = {data: QiddiyaActivity[]};
+
+type QiddiyaDashboardResponse = {
+  data: {
+    parkInfo?: {
+      isOpen?: boolean;
+      openingHours?: string;
+    };
+  };
+};
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const DESTINATION_ID = 'qiddiyacity';
+const DESTINATION_NAME = 'Qiddiya City';
+
+// Park identifiers (stable — used as wiki external IDs).
+const SIX_FLAGS_PARK_ID = 'sixflagsqiddiyacity';
+const AQUA_RABIA_PARK_ID = 'aquarabiaqiddiyacity';
+
+// Approximate centroids derived from the published ride locations in each park.
+const SIX_FLAGS_LOCATION = {latitude: 24.5876, longitude: 46.3327};
+const AQUA_RABIA_LOCATION = {latitude: 24.5865, longitude: 46.3260};
+
+// The Qiddiya API returns some `title` values in Arabic (roughly 40% of
+// entries, despite `accept-language: en`). The `name` field is always a
+// consistent English slug, so fall back to it when the title contains any
+// Arabic-script characters.
+const ARABIC_SCRIPT_RE = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/;
+
+function pickEnglishName(item: QiddiyaActivity): string {
+  const title = (item.title || '').trim();
+  if (title && !ARABIC_SCRIPT_RE.test(title)) return title;
+  return slugToTitleCase(item.name || '');
+}
+
+function slugToTitleCase(slug: string): string {
+  return slug
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+// JS Date.getDay() returns 0 (Sun) ... 6 (Sat).
+const DAY_NAMES = [
+  'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday',
+] as const;
+
+// Lookup for parsing day-name strings from the website CMS.
+const DAY_NAME_TO_INDEX: Record<string, number> = {
+  sunday: 0, monday: 1, tuesday: 2, wednesday: 3,
+  thursday: 4, friday: 5, saturday: 6,
+};
+
+// Number of days of schedule data to project from the weekly pattern.
+const SCHEDULE_DAYS = 30;
+
+/** Convert a 12h hour + AM/PM period to a 24h hour. */
+function to24Hour(hour: number, period: string): number {
+  if (period === 'AM') return hour === 12 ? 0 : hour;
+  return hour === 12 ? 12 : hour + 12;
+}
+
+/**
+ * True when a close time (24h HH:mm) falls on the calendar day after an
+ * open time (24h HH:mm) — i.e. the venue closes past midnight relative to
+ * opening. Compares as zero-padded 24h strings, so lexical order matches
+ * chronological order within a day; a close time that is not later than
+ * open (e.g. open 16:00 / close 01:00) means it rolled into the next day,
+ * not just an exact "00:00" close.
+ */
+export function closesNextDay(open: string, close: string): boolean {
+  return close <= open;
+}
+
+/**
+ * Parse a dashboard `openingHours` string like "4:00 PM - 12:00 AM KSA"
+ * into 24h HH:mm open/close times. Returns null for non-matching strings
+ * (e.g. "Closed").
+ */
+export function parseDashboardHours(str: string): {open: string; close: string} | null {
+  const match = (str || '').match(/(\d{1,2}):(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (!match) return null;
+
+  const openHour = to24Hour(parseInt(match[1], 10), match[3].toUpperCase());
+  const closeHour = to24Hour(parseInt(match[4], 10), match[6].toUpperCase());
+
+  return {
+    open: `${String(openHour).padStart(2, '0')}:${match[2]}`,
+    close: `${String(closeHour).padStart(2, '0')}:${match[5]}`,
+  };
+}
+
+/**
+ * Fallback schedule source for when the website scrape that normally
+ * supplies the weekly hours pattern is unavailable (e.g. WAF-blocked —
+ * see getWebsiteSchedule). The dashboard endpoint lives on a different
+ * subdomain and only ever reports *today's* hours, not a weekly pattern,
+ * so this covers a single day rather than a full projection.
+ */
+export function buildTodayScheduleFromDashboard(
+  dashboard: QiddiyaDashboardResponse['data'] | undefined,
+  today: Date,
+  timezone: string,
+): Array<{date: string; type: string; openingTime: string; closingTime: string}> {
+  if (dashboard?.parkInfo?.isOpen === false) return [];
+
+  const hours = parseDashboardHours(dashboard?.parkInfo?.openingHours || '');
+  if (!hours) return [];
+
+  const dateStr = formatDate(today, timezone);
+  const closingDate = closesNextDay(hours.open, hours.close) ? formatDate(addDays(today, 1), timezone) : dateStr;
+
+  return [{
+    date: dateStr,
+    type: 'OPERATING',
+    openingTime: constructDateTime(dateStr, hours.open, timezone),
+    closingTime: constructDateTime(closingDate, hours.close, timezone),
+  }];
+}
+
+/** Shape of the megaMenu locationWeatherSchedule fields the weekly parser reads. */
+export interface MegaMenuSchedule {
+  weekdaysSchedule?: string;
+  weekendsSchedule?: string;
+  currentWeatherProTips?: Array<{relatedWeather?: string; proTipText?: string}>;
+}
+
+// Saudi Arabia work week: the weekend is Fri/Sat, weekdays run Sun–Thu. The
+// site labels its two schedule strings "Weekdays"/"Weekends" against this.
+const SAUDI_WEEKDAYS = [0, 1, 2, 3, 4]; // Sun–Thu
+const SAUDI_WEEKEND = [5, 6]; // Fri, Sat
+
+/** Map a day token ("saturdays"/"sun"/"wed") to a 0=Sun..6=Sat index, or -1. */
+function dayNameToIndex(name: string): number {
+  const clean = name.replace(/s$/i, '').trim().toLowerCase(); // "saturdays" → "saturday"
+  for (const [key, idx] of Object.entries(DAY_NAME_TO_INDEX)) {
+    if (key.startsWith(clean) || clean.startsWith(key.substring(0, 3))) {
+      return idx;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Parse a day spec into 0=Sun..6=Sat indices. Handles the literal words
+ * "Weekdays"/"Weekends" (the wording the live site currently emits) plus day
+ * ranges ("wed to fri") and single days ("saturdays", "sun").
+ */
+function parseDaySpec(text: string): number[] {
+  const days: number[] = [];
+  // Split on "&" / "," to handle "Wed to Fri & Sun"
+  const parts = text.split(/[&,]/).map((s) => s.trim().replace(/from\s*$/i, '').trim());
+
+  for (const part of parts) {
+    if (/weekend/i.test(part)) { days.push(...SAUDI_WEEKEND); continue; }
+    if (/weekday/i.test(part)) { days.push(...SAUDI_WEEKDAYS); continue; }
+
+    // Range: "wed to fri"
+    const rangeMatch = part.match(/(\w+)\s+to\s+(\w+)/i);
+    if (rangeMatch) {
+      const start = dayNameToIndex(rangeMatch[1]);
+      const end = dayNameToIndex(rangeMatch[2]);
+      if (start >= 0 && end >= 0) {
+        // Walk from start to end (wrapping around the week)
+        let d = start;
+        while (true) {
+          days.push(d);
+          if (d === end) break;
+          d = (d + 1) % 7;
+        }
+      }
+      continue;
+    }
+
+    // Single day: "saturdays" / "sunday" / "sat"
+    const idx = dayNameToIndex(part);
+    if (idx >= 0) days.push(idx);
+  }
+
+  return days;
+}
+
+/**
+ * Parse one schedule string ("Weekdays: 4 PM - 12 AM", "Wed to Fri & Sun 3 PM
+ * - 11 PM", "Saturdays 12 PM - 12 AM") into day-index → {open, close} entries,
+ * skipping any day listed in closedDays.
+ */
+function parseScheduleString(
+  str: string,
+  out: Record<number, {open: string; close: string}>,
+  closedDays: Set<number>,
+): void {
+  // Extract the time portion: "N PM - N PM" or "N AM - N AM"
+  const timeMatch = str.match(/(\d{1,2})\s*(AM|PM)\s*-\s*(\d{1,2})\s*(AM|PM)/i);
+  if (!timeMatch) return;
+
+  const openHour = to24Hour(parseInt(timeMatch[1], 10), timeMatch[2].toUpperCase());
+  const closeHour = to24Hour(parseInt(timeMatch[3], 10), timeMatch[4].toUpperCase());
+  const open = `${String(openHour).padStart(2, '0')}:00`;
+  const close = `${String(closeHour).padStart(2, '0')}:00`;
+
+  // Day names/ranges live in the text before the time portion.
+  const dayPart = str.substring(0, timeMatch.index).toLowerCase();
+  for (const dayIdx of parseDaySpec(dayPart)) {
+    if (!closedDays.has(dayIdx)) {
+      out[dayIdx] = {open, close};
+    }
+  }
+}
+
+/** Extract closed-day indices from proTip text like "Mondays & Tuesdays". */
+function parseClosedDays(closedText: string): Set<number> {
+  const closed = new Set<number>();
+  const lower = (closedText || '').toLowerCase();
+  for (const [dayName, dayIdx] of Object.entries(DAY_NAME_TO_INDEX)) {
+    if (lower.includes(dayName.toLowerCase())) closed.add(dayIdx);
+  }
+  return closed;
+}
+
+/**
+ * Build a weekly hours map (0=Sun..6=Sat → {open, close} in 24h HH:mm) from the
+ * website megaMenu's locationWeatherSchedule. Understands both the current
+ * "Weekdays/Weekends" wording and legacy day-range strings, and drops days
+ * listed as closed in the proTips.
+ */
+export function buildWeeklyScheduleFromMegaMenu(
+  lws: MegaMenuSchedule | null | undefined,
+): Record<number, {open: string; close: string}> {
+  const schedule: Record<number, {open: string; close: string}> = {};
+  if (!lws) return schedule;
+
+  const closedText = lws.currentWeatherProTips
+    ?.find((t) => t.relatedWeather === 'all')?.proTipText || '';
+  const closedDays = parseClosedDays(closedText);
+
+  if (lws.weekdaysSchedule) parseScheduleString(lws.weekdaysSchedule, schedule, closedDays);
+  if (lws.weekendsSchedule) parseScheduleString(lws.weekendsSchedule, schedule, closedDays);
+
+  return schedule;
+}
+
+// Classify an activity as belonging to Six Flags or Aqua Rabia based on the
+// asset path in its image URL. The shared API endpoint returns activities for
+// both parks mixed together.
+function activityParkId(a: QiddiyaActivity): string {
+  const path = a?.mobileImageAttribute?.externalPath || '';
+  return path.includes('/assets/aquarabia/') ? AQUA_RABIA_PARK_ID : SIX_FLAGS_PARK_ID;
+}
+
+// ─── Implementation ───────────────────────────────────────────────────────────
+
+@destinationController({category: 'Qiddiya City'})
+export class QiddiyaCity extends Destination {
+  @config
+  apiBase: string = '';
+
+  @config
+  webBase: string = '';
+
+  @config
+  appVersion: string = '2.6';
+
+  timezone: string = 'Asia/Riyadh';
+
+  constructor(options?: DestinationConstructor) {
+    super(options);
+    this.addConfigPrefix('QIDDIYACITY');
+  }
+
+  // ─── Header injection ────────────────────────────────────────────────────
+
+  /** Inject mobile-app identification headers on API requests (not website). */
+  @inject({
+    eventName: 'httpRequest',
+    hostname: function(this: QiddiyaCity) {
+      return hostnameFromUrl(this.apiBase);
+    },
+    tags: {$nin: ['website']},
+  })
+  async injectHeaders(req: HTTPObj): Promise<void> {
+    req.headers = {
+      ...req.headers,
+      'user-agent': '(iPhone; iOS 26.3.1)',
+      'accept-language': 'en',
+      'is_public_request': 'true',
+      'x-client-type': 'mobile',
+      'x-client-v': this.appVersion,
+    };
+  }
+
+  // ─── HTTP fetch methods ──────────────────────────────────────────────────
+
+  /** Fetch all activities (rides, dining, entertainment, shopping, facilities). */
+  @http({cacheSeconds: 60} as any)
+  async fetchActivities(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/sixflags/info-guide/api/v3/activities?page=1&limit=250&sort=name&sortDirection=asc&map=true`,
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /** Fetch park-level dashboard (isOpen, opening hours). Six Flags only. */
+  @http({cacheSeconds: 60} as any)
+  async fetchDashboard(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.apiBase}/sixflags/info-guide/api/v1/dashboard`,
+      options: {json: true},
+    } as any as HTTPObj;
+  }
+
+  /** Fetch the public website homepage — contains schedule data in a svelte component. */
+  @http({cacheSeconds: 43200} as any) // 12h — CMS content changes rarely
+  async fetchWebsite(): Promise<HTTPObj> {
+    return {
+      method: 'GET',
+      url: `${this.webBase}/en`,
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'accept': 'text/html',
+        'accept-language': 'en-US,en;q=0.9',
+      },
+      options: {json: false},
+      tags: ['website'],
+    } as any as HTTPObj;
+  }
+
+  // ─── Cached data accessors ──────────────────────────────────────────────
+
+  /** All activities for both parks. Use activityParkId() to partition. */
+  @cache({ttlSeconds: 60})
+  async getActivities(): Promise<QiddiyaActivity[]> {
+    const resp = await this.fetchActivities();
+    const data: QiddiyaActivitiesResponse = await resp.json();
+    return data?.data || [];
+  }
+
+  @cache({ttlSeconds: 60})
+  async getDashboard(): Promise<QiddiyaDashboardResponse['data']> {
+    const resp = await this.fetchDashboard();
+    const data: QiddiyaDashboardResponse = await resp.json();
+    return data?.data || {};
+  }
+
+  /**
+   * Scrape weekly schedule from the website's megaMenu svelte component.
+   * Returns a map of day index (0=Sun..6=Sat) → {open, close} in HH:mm,
+   * or absent for closed days.
+   *
+   * sixflagsqiddiyacity.com sits behind Cloudflare Bot Management, which
+   * can 403 this fetch independently of the api.* subdomain used for
+   * activities/live data (confirmed 2026-07-19: browser UA didn't help,
+   * bot-management blocks are fingerprint/reputation-based, not header-
+   * based). When that happens this returns {} and buildSchedules() falls
+   * back to buildTodayScheduleFromDashboard() for a same-day-only schedule.
+   */
+  @cache({ttlSeconds: 43200}) // 12h
+  async getWebsiteSchedule(): Promise<Record<number, {open: string; close: string}>> {
+    try {
+      const resp = await this.fetchWebsite();
+      const html = await resp.text();
+
+      // Extract the megaMenu component's data-json-content
+      const match = html.match(/data-component="megaMenu"[^>]*data-json-content="([^"]+)"/);
+      if (!match) return {};
+
+      // Decode HTML entities in the attribute value
+      const decoded = match[1]
+        .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+        .replace(/&#34;/g, '"').replace(/&#39;/g, "'")
+        .replace(/&apos;/g, "'");
+
+      const data = JSON.parse(decoded);
+      return buildWeeklyScheduleFromMegaMenu(data?.locationWeatherSchedule);
+    } catch (err) {
+      console.warn('QiddiyaCity: failed to scrape website schedule:', err);
+      return {};
+    }
+  }
+
+  // ─── Destination + entities ─────────────────────────────────────────────
+
+  async getDestinations(): Promise<Entity[]> {
+    return [{
+      id: DESTINATION_ID,
+      name: DESTINATION_NAME,
+      entityType: 'DESTINATION',
+      timezone: this.timezone,
+      location: SIX_FLAGS_LOCATION,
+    } as Entity];
+  }
+
+  protected async buildEntityList(): Promise<Entity[]> {
+    const activities = await this.getActivities();
+
+    const sixFlagsPark: Entity = {
+      id: SIX_FLAGS_PARK_ID,
+      name: 'Six Flags Qiddiya City',
+      entityType: 'PARK',
+      parentId: DESTINATION_ID,
+      destinationId: DESTINATION_ID,
+      timezone: this.timezone,
+      location: SIX_FLAGS_LOCATION,
+    } as Entity;
+
+    const aquaRabiaPark: Entity = {
+      id: AQUA_RABIA_PARK_ID,
+      name: 'Aqua Rabia Qiddiya City',
+      entityType: 'PARK',
+      parentId: DESTINATION_ID,
+      destinationId: DESTINATION_ID,
+      timezone: this.timezone,
+      location: AQUA_RABIA_LOCATION,
+    } as Entity;
+
+    const attractionEntities = this.mapActivities(
+      activities.filter((a) => a.category === 'RIDES'),
+      'ATTRACTION',
+    );
+    const restaurantEntities = this.mapActivities(
+      activities.filter((a) => a.category === 'DINING'),
+      'RESTAURANT',
+    );
+    const showEntities = this.mapActivities(
+      activities.filter((a) => a.category === 'ENTERTAINMENT'),
+      'SHOW',
+    );
+
+    return [
+      sixFlagsPark,
+      aquaRabiaPark,
+      ...attractionEntities,
+      ...restaurantEntities,
+      ...showEntities,
+    ];
+  }
+
+  /** Shared mapEntities config for the three categories we expose. */
+  private mapActivities(items: QiddiyaActivity[], entityType: Entity['entityType']): Entity[] {
+    return this.mapEntities(items, {
+      idField: 'id',
+      nameField: (item) => pickEnglishName(item),
+      entityType,
+      parentIdField: (item) => activityParkId(item),
+      destinationId: DESTINATION_ID,
+      timezone: this.timezone,
+      locationFields: {
+        // The ENTERTAINMENT row publishes 0,0; treat that as missing.
+        lat: (item) => (item.location && item.location.latitude !== 0 ? item.location.latitude : undefined),
+        lng: (item) => (item.location && item.location.longitude !== 0 ? item.location.longitude : undefined),
+      },
+      transform: (entity, item) => {
+        const tags: any[] = [];
+        if (item.minHeight != null && item.minHeight > 0) {
+          tags.push(TagBuilder.minimumHeight(item.minHeight, 'cm'));
+        }
+        if (item.maxHeight != null && item.maxHeight > 0) {
+          tags.push(TagBuilder.maximumHeight(item.maxHeight, 'cm'));
+        }
+        if (item.goFastPass) {
+          tags.push(TagBuilder.paidReturnTime());
+        }
+        if (tags.length > 0) entity.tags = tags;
+        return entity;
+      },
+    });
+  }
+
+  // ─── Live data ───────────────────────────────────────────────────────────
+
+  protected async buildLiveData(): Promise<LiveData[]> {
+    const [activities, dashboard] = await Promise.all([
+      this.getActivities(),
+      this.getDashboard(),
+    ]);
+
+    const rides = activities.filter((a) => a.category === 'RIDES');
+    const sixFlagsRides = rides.filter((r) => activityParkId(r) === SIX_FLAGS_PARK_ID);
+    const aquaRabiaRides = rides.filter((r) => activityParkId(r) === AQUA_RABIA_PARK_ID);
+
+    // Determine Six Flags park status from multiple signals:
+    // 1. Dashboard isOpen flag (authoritative when present, but often absent)
+    // 2. Whether any ride has waitTime > 0 (strongest real-world signal)
+    // 3. Default to CLOSED if no signal
+    const sixFlagsDashboardOpen = dashboard?.parkInfo?.isOpen;
+    const sixFlagsAnyWait = sixFlagsRides.some((r) => r.waitTime != null && r.waitTime > 0);
+    const sixFlagsOpen = sixFlagsDashboardOpen === true
+      || (sixFlagsDashboardOpen === undefined && sixFlagsAnyWait);
+
+    // Aqua Rabia: no dedicated dashboard endpoint yet. Use the same wait-time
+    // heuristic; defaults to CLOSED until the park opens and starts publishing.
+    const aquaRabiaOpen = aquaRabiaRides.some((r) => r.waitTime != null && r.waitTime > 0);
+
+    const toLiveData = (ride: QiddiyaActivity, parkOpen: boolean): LiveData => {
+      const isRideOperating = parkOpen && ride.waitTime != null && ride.waitTime >= 0;
+      const status: LiveData['status'] = isRideOperating ? 'OPERATING' : 'CLOSED';
+      const ld: LiveData = {id: ride.id, status} as LiveData;
+      if (status === 'OPERATING' && ride.waitTime != null && ride.waitTime > 0) {
+        ld.queue = {STANDBY: {waitTime: ride.waitTime}};
+      }
+      return ld;
+    };
+
+    return [
+      ...sixFlagsRides.map((r) => toLiveData(r, sixFlagsOpen)),
+      ...aquaRabiaRides.map((r) => toLiveData(r, aquaRabiaOpen)),
+    ];
+  }
+
+  // ─── Schedules ───────────────────────────────────────────────────────────
+
+  protected async buildSchedules(): Promise<EntitySchedule[]> {
+    const weeklyHours = await this.getWebsiteSchedule();
+
+    // Six Flags schedule from sixflagsqiddiyacity.com. Aqua Rabia's dedicated
+    // schedule isn't available yet; return an empty schedule for it until we
+    // can scrape aquarabiaqiddiyacity.com closer to opening.
+    const aquaRabia: EntitySchedule = {id: AQUA_RABIA_PARK_ID, schedule: []} as EntitySchedule;
+
+    if (Object.keys(weeklyHours).length === 0) {
+      const dashboard = await this.getDashboard();
+      const todaySchedule = buildTodayScheduleFromDashboard(dashboard, new Date(), this.timezone);
+      return [{id: SIX_FLAGS_PARK_ID, schedule: todaySchedule} as EntitySchedule, aquaRabia];
+    }
+
+    // Project the weekly pattern onto the next N days.
+    const schedule: any[] = [];
+    const today = new Date();
+    for (let i = 0; i < SCHEDULE_DAYS; i++) {
+      const date = addDays(today, i);
+      const dateStr = formatDate(date, this.timezone);
+
+      // Day-of-week in the park's timezone (not the server's local day).
+      const dayIdx = this.getDayOfWeekInTimezone(date);
+      const hours = weeklyHours[dayIdx];
+      if (!hours) continue; // Closed day
+
+      // Handle overnight closing (e.g. "12 AM" or "1 AM" = next day)
+      const closingDate = closesNextDay(hours.open, hours.close) ? formatDate(addDays(date, 1), this.timezone) : dateStr;
+
+      schedule.push({
+        date: dateStr,
+        type: 'OPERATING',
+        openingTime: constructDateTime(dateStr, hours.open, this.timezone),
+        closingTime: constructDateTime(closingDate, hours.close, this.timezone),
+      });
+    }
+
+    return [{id: SIX_FLAGS_PARK_ID, schedule} as EntitySchedule, aquaRabia];
+  }
+
+  /** Get day-of-week (0 = Sunday) for a Date as observed in the park's timezone. */
+  private getDayOfWeekInTimezone(date: Date): number {
+    const weekday = new Intl.DateTimeFormat('en-US', {
+      timeZone: this.timezone,
+      weekday: 'long',
+    }).format(date);
+    const idx = DAY_NAMES.indexOf(weekday as any);
+    return idx >= 0 ? idx : date.getUTCDay();
+  }
+}

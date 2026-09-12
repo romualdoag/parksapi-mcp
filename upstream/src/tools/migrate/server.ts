@@ -1,0 +1,298 @@
+/**
+ * Migration review server.
+ *
+ * Serves the review UI and provides API endpoints for viewing/editing
+ * mappings and committing ID changes to the ThemeParks.wiki API.
+ */
+
+import express from 'express';
+import {readFileSync} from 'fs';
+import {join} from 'path';
+import os from 'node:os';
+import type {Mapping, NewEntity} from './matcher.js';
+
+interface ServerConfig {
+  mappings: Mapping[];
+  unmatchedNew: NewEntity[];
+  allNewEntities: NewEntity[];
+  parkName: string;
+  wikiApiUrl: string;
+  wikiUsername: string;
+  wikiApiKey: string;
+  wikiToken: string;
+  port: number;
+}
+
+export function startMigrationServer(config: ServerConfig): void {
+  const app = express();
+  app.use(express.json());
+
+  // State
+  let mappings = config.mappings;
+  let commitInProgress = false;
+  let commitResults: Array<{wikiId: string; oldId: string; newId: string; success: boolean; error?: string}> = [];
+  let commitListeners: Array<(event: string, data: any) => void> = [];
+
+  // ── Static UI ────────────────────────────────────────────────
+
+  app.get('/', (_req, res) => {
+    const htmlPath = join(import.meta.dirname, 'ui', 'index.html');
+    const html = readFileSync(htmlPath, 'utf-8');
+    res.type('html').send(html);
+  });
+
+  // ── API: Mappings ────────────────────────────────────────────
+
+  const isNoop = (m: Mapping) =>
+    m.newExternalId != null && m.oldExternalId === m.newExternalId;
+
+  app.get('/api/mappings', (_req, res) => {
+    const enriched = mappings.map(m => ({...m, noop: isNoop(m)}));
+    res.json({
+      parkName: config.parkName,
+      mappings: enriched,
+      unmatchedNew: config.unmatchedNew,
+      allNewEntities: config.allNewEntities,
+      summary: {
+        exact: mappings.filter(m => m.confidence === 'exact').length,
+        fuzzy: mappings.filter(m => m.confidence === 'fuzzy').length,
+        unmatched: mappings.filter(m => m.confidence === 'unmatched').length,
+        noop: mappings.filter(isNoop).length,
+        confirmed: mappings.filter(m => m.status === 'confirmed' && m.newExternalId && !isNoop(m)).length,
+        skipped: mappings.filter(m => m.status === 'skip').length,
+      },
+    });
+  });
+
+  app.post('/api/mappings/:index', (req, res) => {
+    const idx = parseInt(req.params.index, 10);
+    if (isNaN(idx) || idx < 0 || idx >= mappings.length) {
+      return res.status(400).json({error: 'Invalid index'});
+    }
+
+    const {action, newExternalId, newName} = req.body;
+
+    if (action === 'skip') {
+      mappings[idx].status = 'skip';
+    } else if (action === 'confirm') {
+      mappings[idx].status = 'confirmed';
+    } else if (action === 'pair' && newExternalId) {
+      // If another mapping already claims this newExternalId, unpair it
+      mappings.forEach((other, otherIdx) => {
+        if (otherIdx !== idx && other.newExternalId === newExternalId && other.status === 'confirmed') {
+          other.newExternalId = null;
+          other.newName = null;
+          other.confidence = 'unmatched';
+          other.confidenceScore = 0;
+          other.status = 'skip';
+        }
+      });
+      mappings[idx].newExternalId = newExternalId;
+      mappings[idx].newName = newName || newExternalId;
+      mappings[idx].confidence = 'fuzzy';
+      mappings[idx].confidenceScore = 0; // manual
+      mappings[idx].status = 'confirmed';
+    } else if (action === 'unpair') {
+      mappings[idx].newExternalId = null;
+      mappings[idx].newName = null;
+      mappings[idx].confidence = 'unmatched';
+      mappings[idx].confidenceScore = 0;
+      mappings[idx].status = 'skip';
+    }
+
+    res.json({ok: true, mapping: mappings[idx]});
+  });
+
+  // ── API: Commit ──────────────────────────────────────────────
+
+  app.post('/api/commit', async (_req, res) => {
+    if (commitInProgress) {
+      return res.status(409).json({error: 'Commit already in progress'});
+    }
+    const hasNewStyleKey = !!config.wikiApiKey?.trim().startsWith('tpw_');
+    const hasLoginCreds = !!(config.wikiUsername && config.wikiApiKey);
+    if (!config.wikiApiUrl || (!config.wikiToken && !hasLoginCreds && !hasNewStyleKey)) {
+      return res.status(400).json({error: 'WIKI_API_URL and one of: a tpw_-prefixed WIKI_API_KEY, WIKI_USERNAME+WIKI_API_KEY, or WIKI_TOKEN must be configured in .env'});
+    }
+
+    const toCommit = mappings.filter(
+      m => m.status === 'confirmed' && m.newExternalId && !isNoop(m),
+    );
+    if (toCommit.length === 0) {
+      return res.status(400).json({error: 'No confirmed mappings to commit (IDs already match are skipped)'});
+    }
+
+    commitInProgress = true;
+    commitResults = [];
+    res.json({ok: true, count: toCommit.length});
+
+    // Run commit in background
+    try {
+      // Authenticate. Three credential shapes, tried in order:
+      //
+      // 1. WIKI_API_KEY starting with `tpw_` — the current-generation API
+      //    key (services/apiKeys.ts on the wiki server), sent directly as
+      //    an X-Api-Key header on every request below. This does NOT go
+      //    through /auth/login: that endpoint's password-login handler
+      //    only checks the legacy single-column `user.apiKey` field
+      //    (auth.controller.ts loginWithPassword -> user.isValidApiKey),
+      //    which the new `tpw_` key system never touches — so a freshly
+      //    generated tpw_ key correctly, permanently 401s there with
+      //    "Invalid username or password" no matter how new it is. The
+      //    key only validates via validateApiKey() (auth.decorator.ts),
+      //    which route-level @auth() middleware calls for the X-Api-Key
+      //    header path, not the login endpoint.
+      // 2. WIKI_USERNAME + WIKI_API_KEY (legacy, non-`tpw_` key) — fresh
+      //    login via /auth/login to mint a JWT.
+      // 3. WIKI_TOKEN — static JWT fallback for setups without login
+      //    credentials at all. No way to detect expiry ahead of time, so
+      //    only used when nothing better is configured.
+      broadcast('status', {message: 'Authenticating...', progress: 0, total: toCommit.length});
+
+      let token: string | null = null;
+      let apiKeyHeader: string | null = null;
+
+      const trimmedApiKey = config.wikiApiKey?.trim();
+      if (trimmedApiKey?.startsWith('tpw_')) {
+        apiKeyHeader = trimmedApiKey;
+      } else if (config.wikiUsername && config.wikiApiKey) {
+        const authResp = await fetch(`${config.wikiApiUrl}/auth/login`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({username: config.wikiUsername, apiKey: config.wikiApiKey}),
+        });
+
+        if (!authResp.ok) {
+          const err = await authResp.text();
+          broadcast('error', {message: `Authentication failed: ${authResp.status} ${err}`});
+          commitInProgress = false;
+          return;
+        }
+
+        token = (await authResp.json() as {token: string}).token;
+      } else if (config.wikiToken) {
+        token = config.wikiToken;
+      } else {
+        broadcast('error', {message: 'No WIKI_USERNAME+WIKI_API_KEY or WIKI_TOKEN configured'});
+        commitInProgress = false;
+        return;
+      }
+      broadcast('status', {message: 'Authenticated', progress: 0, total: toCommit.length});
+
+      // Commit each mapping
+      for (let i = 0; i < toCommit.length; i++) {
+        const mapping = toCommit[i];
+
+        try {
+          const putResp = await fetch(`${config.wikiApiUrl}/v1/entity/${mapping.wikiId}/_id`, {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(apiKeyHeader ? {'X-Api-Key': apiKeyHeader} : {'Authorization': `Bearer ${token}`}),
+            },
+            body: JSON.stringify({_id: mapping.newExternalId}),
+          });
+
+          if (putResp.ok) {
+            commitResults.push({
+              wikiId: mapping.wikiId,
+              oldId: mapping.oldExternalId,
+              newId: mapping.newExternalId!,
+              success: true,
+            });
+            broadcast('progress', {
+              index: i + 1,
+              total: toCommit.length,
+              name: mapping.oldName,
+              oldId: mapping.oldExternalId,
+              newId: mapping.newExternalId,
+              success: true,
+            });
+          } else {
+            const errText = await putResp.text();
+            commitResults.push({
+              wikiId: mapping.wikiId,
+              oldId: mapping.oldExternalId,
+              newId: mapping.newExternalId!,
+              success: false,
+              error: `${putResp.status}: ${errText}`,
+            });
+            broadcast('progress', {
+              index: i + 1,
+              total: toCommit.length,
+              name: mapping.oldName,
+              oldId: mapping.oldExternalId,
+              newId: mapping.newExternalId,
+              success: false,
+              error: `${putResp.status}: ${errText}`,
+            });
+          }
+        } catch (err: any) {
+          commitResults.push({
+            wikiId: mapping.wikiId,
+            oldId: mapping.oldExternalId,
+            newId: mapping.newExternalId!,
+            success: false,
+            error: err.message,
+          });
+          broadcast('progress', {
+            index: i + 1,
+            total: toCommit.length,
+            name: mapping.oldName,
+            success: false,
+            error: err.message,
+          });
+        }
+      }
+
+      const succeeded = commitResults.filter(r => r.success).length;
+      const failed = commitResults.filter(r => !r.success).length;
+      broadcast('complete', {succeeded, failed, results: commitResults});
+    } catch (err: any) {
+      broadcast('error', {message: err.message});
+    } finally {
+      commitInProgress = false;
+    }
+  });
+
+  // ── SSE: Commit progress ─────────────────────────────────────
+
+  app.get('/api/commit/status', (req, res) => {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+
+    const listener = (event: string, data: any) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    commitListeners.push(listener);
+
+    req.on('close', () => {
+      commitListeners = commitListeners.filter(l => l !== listener);
+    });
+  });
+
+  function broadcast(event: string, data: any) {
+    for (const listener of commitListeners) {
+      listener(event, data);
+    }
+  }
+
+  // ── Start ────────────────────────────────────────────────────
+
+  app.listen(config.port, '0.0.0.0', () => {
+    const rawHost = process.env.MIGRATE_HOST || os.hostname();
+    // Bracket IPv6 literals (`::1`, `fe80::1`) for the printed URL — `http://::1:9900/`
+    // isn't a valid URL, but `http://[::1]:9900/` is.
+    const isBracketedIPv6 = /^\[.+\]$/.test(rawHost);
+    const looksIPv6 = !isBracketedIPv6 && rawHost.includes(':');
+    const host = looksIPv6 ? `[${rawHost}]` : rawHost;
+    console.log(`\nMigration review server running on :${config.port} (bound 0.0.0.0)`);
+    console.log(`  ${config.parkName}`);
+    console.log(`  ${mappings.length} mappings to review`);
+    console.log(`\nOpen http://${host}:${config.port}/ in your browser to review (or http://localhost:${config.port}/ when running on the same machine).\n`);
+  });
+}

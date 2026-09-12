@@ -1,0 +1,75 @@
+{
+  "name": "@themeparks/parksapi",
+  "type": "module",
+  "version": "2.0.0",
+  "description": "",
+  "engines": {
+    "npm": ">=11",
+    "node": ">=24"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "dev": "npm run ts-dev -- src/test.ts",
+    "ts-dev": "tsx --env-file=.env",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:ui": "vitest --ui",
+    "web": "npm run build && NODE_ENV=production npm run ts-dev -- src/webServer.ts",
+    "web:dev": "concurrently -n \"API,UI\" -c \"blue,magenta\" \"npm run ts-dev -- src/webServer.ts\" \"cd web-ui && npm run dev\"",
+    "web:build": "cd web-ui && npm run build",
+    "harness": "tsx --env-file=.env src/harness/compare.ts",
+    "health": "tsx --env-file=.env src/harness/health.ts",
+    "migrate": "tsx --env-file=.env src/tools/migrate/index.ts",
+    "migrate:audit": "tsx --env-file=.env src/tools/migrate/audit.ts",
+    "audit:live": "tsx --env-file=.env src/tools/audit/live.ts",
+    "har": "tsx src/tools/har/index.ts",
+    "docs": "typedoc",
+    "prepare": "tsc && ([ \"$(git rev-parse --show-toplevel 2>/dev/null)\" = \"$(pwd -P)\" ] && git config core.hooksPath .githooks || true)",
+    "readme": "tsx src/tools/readme/destinations.ts",
+    "stale": "tsx --env-file=.env src/tools/staleReport.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ThemeParks/parksapi.git"
+  },
+  "author": "@cube",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/ThemeParks/parksapi/issues"
+  },
+  "homepage": "https://github.com/ThemeParks/parksapi#readme",
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/node": "^26.0.0",
+    "@types/tz-lookup": "^6.1.2",
+    "@vitest/coverage-v8": "^5.0.0",
+    "@vitest/ui": "^5.0.0",
+    "concurrently": "^10.0.3",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "tsx": "^4.20.5",
+    "typedoc": "^0.28.19",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.0"
+  },
+  "dependencies": {
+    "@themeparks/typelib": "^1.2.0",
+    "adm-zip": "^0.6.0",
+    "ajv": "^8.17.1",
+    "sift": "^17.1.3",
+    "tz-lookup": "^6.1.25",
+    "undici": "^8.1.0"
+  }
+}

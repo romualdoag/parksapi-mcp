@@ -2,9 +2,10 @@
 
 Generic MCP server over [`@themeparks/parksapi`](https://github.com/ThemeParks/parksapi) —
 every destination the library supports (80+ theme parks worldwide), no per-park code,
-**plus** the four Walt Disney World (Orlando) parks via the public
+**plus** the Orlando parks the library can't serve without app credentials —
+4x Walt Disney World and 3x Universal Orlando Resort — via the public
 [`api.themeparks.wiki`](https://www.themeparks.wiki/api) collector feed
-(the upstream TS library leaves WDW out of scope — see `src/hosted.ts`).
+(see `src/hosted.ts`).
 
 ## Tools
 
@@ -48,7 +49,7 @@ Claude Desktop / Hermes config:
 }
 ```
 
-## Tests (vitest, 26 testes)
+## Tests (vitest, 28 testes)
 
 ```bash
 npm test   # build + suite completa
@@ -59,9 +60,12 @@ npm test   # build + suite completa
 - `tests/live.test.ts` — Efteling ao vivo (sem credenciais)
 - `tests/protocol.test.ts` — servidor real via JSON-RPC stdio
 
-## Walt Disney World (Orlando)
+## Orlando hospedado (sem credenciais)
 
-Quatro destinations extras, categoria `Disney`, sem credenciais:
+Sete destinations extras via feed público do coletor
+(`api.themeparks.wiki/preview/parks/...`, padrão `HostedPark` da lib legada).
+A lib TS deixa WDW fora de escopo e só cobre a Universal com chaves de app
+(sem elas, `universalorlando` retorna `Invalid URL`) — por isso servimos aqui:
 
 | Park | `destination` |
 |---|---|
@@ -69,10 +73,11 @@ Quatro destinations extras, categoria `Disney`, sem credenciais:
 | Epcot | `waltdisneyworldepcot` |
 | Hollywood Studios | `waltdisneyworldhollywoodstudios` |
 | Animal Kingdom | `waltdisneyworldanimalkingdom` |
+| Universal Studios Florida | `universalstudiosflorida` |
+| Islands of Adventure | `universalislandsofadventure` |
+| Volcano Bay | `universalvolcanobay` |
 
-Fonte: feed público do coletor (`api.themeparks.wiki/preview/parks/...`,
-mesmo padrão `HostedPark` da lib JS legada). `get_entities`,
-`get_live_data` e `get_schedules` funcionam igual aos outros parks.
+`get_entities`, `get_live_data` e `get_schedules` funcionam igual aos outros parks.
 Para adicionar mais parks hospedados (ex. Disneyland California, Hong Kong),
 basta uma entrada em `HOSTED_DESTINATIONS` (`src/hosted.ts`).
 

@@ -142,16 +142,38 @@ describe("preview API mapping", () => {
 });
 
 describe("hosted registry wiring", () => {
-  it("exposes exactly the four Orlando parks", () => {
-    expect(HOSTED_DESTINATIONS.map((d) => d.id).sort()).toEqual(
-      [
-        "waltdisneyworldanimalkingdom",
-        "waltdisneyworldepcot",
-        "waltdisneyworldhollywoodstudios",
-        "waltdisneyworldmagickingdom",
-      ].sort(),
-    );
-    for (const d of HOSTED_DESTINATIONS) expect(d.category).toBe("Disney");
+  it("exposes the four Orlando Disney parks", () => {
+    const ids = new Set(HOSTED_DESTINATIONS.map((d) => d.id));
+    for (const id of [
+      "waltdisneyworldanimalkingdom",
+      "waltdisneyworldepcot",
+      "waltdisneyworldhollywoodstudios",
+      "waltdisneyworldmagickingdom",
+    ]) {
+      expect(ids.has(id)).toBe(true);
+    }
+    for (const d of HOSTED_DESTINATIONS.filter((x) =>
+      x.id.startsWith("waltdisneyworld"),
+    )) {
+      expect(d.category).toBe("Disney");
+    }
+  });
+
+  it("exposes the three Universal Orlando Resort parks", () => {
+    const ids = new Set(HOSTED_DESTINATIONS.map((d) => d.id));
+    for (const id of [
+      "universalstudiosflorida",
+      "universalislandsofadventure",
+      "universalvolcanobay",
+    ]) {
+      expect(ids.has(id)).toBe(true);
+    }
+    for (const d of HOSTED_DESTINATIONS.filter((x) =>
+      ["universalstudiosflorida", "universalislandsofadventure", "universalvolcanobay"].includes(x.id),
+    )) {
+      expect(d.category).toBe("Universal");
+    }
+    expect(HOSTED_DESTINATIONS).toHaveLength(7);
   });
 
   it("lists them via listDestinations + Disney filter", async () => {
@@ -162,6 +184,12 @@ describe("hosted registry wiring", () => {
     const dids = new Set(disney.map((d) => d.id));
     expect(dids.has("waltdisneyworldmagickingdom")).toBe(true);
     expect(dids.has("disneylandparis")).toBe(true);
+    const universal = await listDestinations("Universal");
+    const uids = new Set(universal.map((d) => d.id));
+    expect(uids.has("universalstudiosflorida")).toBe(true);
+    expect(uids.has("universalislandsofadventure")).toBe(true);
+    expect(uids.has("universalvolcanobay")).toBe(true);
+    expect(uids.has("universalorlando")).toBe(true);
   });
 
   it("describes a hosted destination", async () => {
@@ -181,5 +209,19 @@ describe("hosted registry wiring", () => {
     const schedules = await park.getSchedules();
     expect(schedules.length).toBe(1);
     expect((schedules[0] as any).schedule.length).toBe(2);
+  });
+
+  it("builds a Universal park end to end (stubbed)", async () => {
+    const d = await getDestination("universalstudiosflorida");
+    expect(d.id).toBe("universalstudiosflorida");
+    expect(d.category).toBe("Universal");
+    const park = await getInstance("universalstudiosflorida");
+    const entities = await park.getEntities();
+    expect(entities.length).toBe(6);
+    expect((entities[0] as any).timezone).toBe("America/New_York");
+    const live = await park.getLiveData();
+    expect(live.length).toBe(4);
+    const schedules = await park.getSchedules();
+    expect(schedules.length).toBe(1);
   });
 });

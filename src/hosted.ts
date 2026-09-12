@@ -1,17 +1,17 @@
 /**
- * hosted.ts — Walt Disney World (Orlando) destinations for parksapi-mcp.
+ * hosted.ts — Orlando parks missing from @themeparks/parksapi, served here.
  *
- * The open-source @themeparks/parksapi library intentionally leaves
- * Walt Disney World / Disneyland Resort / Hong Kong Disneyland "out of
- * scope" (see upstream TODO.MD: Disney locked down the direct
- * facility-service API). The legacy JS library serves these parks as
- * "HostedPark" shims over the public collector endpoint
- * https://api.themeparks.wiki/preview/parks/<ParkAPIID>/{waittime,calendar/}.
+ * The open-source library leaves Walt Disney World (4 parks) out of scope
+ * (see upstream TODO.MD: Disney locked down the direct facility-service
+ * API) and covers Universal Orlando only with app-extracted API credentials
+ * (empty defaults → "Invalid URL" without them). The legacy JS library
+ * serves these parks as "HostedPark" shims over the public collector
+ * endpoint https://api.themeparks.wiki/preview/parks/<ParkAPIID>/{waittime,calendar/}.
  *
- * This module ports that HostedPark pattern into the MCP as four native
- * Destination subclasses (one per Orlando park), so the existing
- * get_entities / get_live_data / get_schedules tools work unchanged.
- * No credentials needed — the preview API is public.
+ * This module ports that HostedPark pattern into the MCP as seven native
+ * Destination subclasses (4x WDW + 3x Universal Orlando Resort), so the
+ * existing get_entities / get_live_data / get_schedules tools work
+ * unchanged. No credentials needed — the preview API is public.
  */
 import {
   Destination,
@@ -139,6 +139,7 @@ export function mapAttractionToEntity(
   a: HostedAttraction,
   parkId: string,
   destinationId: string,
+  timezone: string = TIMEZONE,
 ): Entity {
   const entity: Record<string, unknown> = {
     id: normalizeEntityId(a.id),
@@ -146,7 +147,7 @@ export function mapAttractionToEntity(
     entityType: mapEntityType(a.meta?.type),
     parentId: parkId,
     destinationId,
-    timezone: TIMEZONE,
+    timezone,
   };
   if (typeof a.meta?.latitude === "number" && typeof a.meta?.longitude === "number") {
     entity.location = { latitude: a.meta.latitude, longitude: a.meta.longitude };
@@ -213,9 +214,12 @@ export type HostedParkDef = {
   name: string;
   latitude: number;
   longitude: number;
+  timezone: string;
+  category: string;
 };
 
-export abstract class HostedDisneyPark extends Destination {
+/** Base class for collector-fed ("hosted") parks: Disney WDW + Universal Orlando. */
+export abstract class HostedCollectorPark extends Destination {
   abstract readonly parkDef: HostedParkDef;
 
   constructor(options?: DestinationConstructor) {
@@ -247,7 +251,7 @@ export abstract class HostedDisneyPark extends Destination {
         id: this.hostedId,
         name: d.name,
         entityType: "DESTINATION",
-        timezone: TIMEZONE,
+        timezone: d.timezone,
         location: { latitude: d.latitude, longitude: d.longitude },
       } as unknown as Entity,
     ];
@@ -262,12 +266,12 @@ export abstract class HostedDisneyPark extends Destination {
       entityType: "PARK",
       parentId: this.hostedId,
       destinationId: this.hostedId,
-      timezone: TIMEZONE,
+      timezone: d.timezone,
       location: { latitude: d.latitude, longitude: d.longitude },
     } as unknown as Entity;
     const attractions = await this.fetchWaittime();
     const entities = attractions.map((a) =>
-      mapAttractionToEntity(a, parkId, this.hostedId),
+      mapAttractionToEntity(a, parkId, this.hostedId, d.timezone),
     );
     return [parkEntity, ...entities];
   }
@@ -285,39 +289,82 @@ export abstract class HostedDisneyPark extends Destination {
   }
 }
 
-export class WaltDisneyWorldMagicKingdom extends HostedDisneyPark {
+const ORLANDO_TZ = "America/New_York";
+
+export class WaltDisneyWorldMagicKingdom extends HostedCollectorPark {
   readonly parkDef: HostedParkDef = {
     parkApiId: "WaltDisneyWorldMagicKingdom",
     name: "Magic Kingdom - Walt Disney World Florida",
     latitude: 28.3852,
     longitude: -81.5639,
+    timezone: ORLANDO_TZ,
+    category: "Disney",
   };
 }
 
-export class WaltDisneyWorldEpcot extends HostedDisneyPark {
+export class WaltDisneyWorldEpcot extends HostedCollectorPark {
   readonly parkDef: HostedParkDef = {
     parkApiId: "WaltDisneyWorldEpcot",
     name: "Epcot - Walt Disney World Florida",
     latitude: 28.3747,
     longitude: -81.5494,
+    timezone: ORLANDO_TZ,
+    category: "Disney",
   };
 }
 
-export class WaltDisneyWorldHollywoodStudios extends HostedDisneyPark {
+export class WaltDisneyWorldHollywoodStudios extends HostedCollectorPark {
   readonly parkDef: HostedParkDef = {
     parkApiId: "WaltDisneyWorldHollywoodStudios",
     name: "Hollywood Studios - Walt Disney World Florida",
     latitude: 28.3575,
     longitude: -81.5583,
+    timezone: ORLANDO_TZ,
+    category: "Disney",
   };
 }
 
-export class WaltDisneyWorldAnimalKingdom extends HostedDisneyPark {
+export class WaltDisneyWorldAnimalKingdom extends HostedCollectorPark {
   readonly parkDef: HostedParkDef = {
     parkApiId: "WaltDisneyWorldAnimalKingdom",
     name: "Animal Kingdom - Walt Disney World Florida",
     latitude: 28.3554,
     longitude: -81.5903,
+    timezone: ORLANDO_TZ,
+    category: "Disney",
+  };
+}
+
+export class UniversalStudiosFlorida extends HostedCollectorPark {
+  readonly parkDef: HostedParkDef = {
+    parkApiId: "UniversalStudiosFlorida",
+    name: "Universal Studios Florida - Universal Orlando Resort",
+    latitude: 28.4794,
+    longitude: -81.4678,
+    timezone: ORLANDO_TZ,
+    category: "Universal",
+  };
+}
+
+export class UniversalIslandsOfAdventure extends HostedCollectorPark {
+  readonly parkDef: HostedParkDef = {
+    parkApiId: "UniversalIslandsOfAdventure",
+    name: "Islands of Adventure - Universal Orlando Resort",
+    latitude: 28.472,
+    longitude: -81.4715,
+    timezone: ORLANDO_TZ,
+    category: "Universal",
+  };
+}
+
+export class UniversalVolcanoBay extends HostedCollectorPark {
+  readonly parkDef: HostedParkDef = {
+    parkApiId: "UniversalVolcanoBay",
+    name: "Volcano Bay - Universal Orlando Resort",
+    latitude: 28.4611,
+    longitude: -81.4733,
+    timezone: ORLANDO_TZ,
+    category: "Universal",
   };
 }
 
@@ -332,27 +379,59 @@ function entry(
   DestinationClass: new () => Destination,
   parkApiId: string,
   name: string,
+  category: string,
 ): HostedRegistryEntry {
-  return { id: parkApiId.toLowerCase(), name, category: "Disney", DestinationClass };
+  return { id: parkApiId.toLowerCase(), name, category, DestinationClass };
 }
 
-/** The four Walt Disney World (Orlando) parks, served via the public collector API. */
+/**
+ * Collector-fed Orlando parks: the four Walt Disney World parks plus the
+ * three Universal Orlando Resort parks (Studios, Islands, Volcano Bay).
+ * The upstream TS library covers neither group without app credentials,
+ * so both are served via the public collector API here.
+ */
 export const HOSTED_DESTINATIONS: HostedRegistryEntry[] = [
   entry(
     WaltDisneyWorldMagicKingdom,
     "WaltDisneyWorldMagicKingdom",
     "Magic Kingdom - Walt Disney World Florida",
+    "Disney",
   ),
-  entry(WaltDisneyWorldEpcot, "WaltDisneyWorldEpcot", "Epcot - Walt Disney World Florida"),
+  entry(
+    WaltDisneyWorldEpcot,
+    "WaltDisneyWorldEpcot",
+    "Epcot - Walt Disney World Florida",
+    "Disney",
+  ),
   entry(
     WaltDisneyWorldHollywoodStudios,
     "WaltDisneyWorldHollywoodStudios",
     "Hollywood Studios - Walt Disney World Florida",
+    "Disney",
   ),
   entry(
     WaltDisneyWorldAnimalKingdom,
     "WaltDisneyWorldAnimalKingdom",
     "Animal Kingdom - Walt Disney World Florida",
+    "Disney",
+  ),
+  entry(
+    UniversalStudiosFlorida,
+    "UniversalStudiosFlorida",
+    "Universal Studios Florida - Universal Orlando Resort",
+    "Universal",
+  ),
+  entry(
+    UniversalIslandsOfAdventure,
+    "UniversalIslandsOfAdventure",
+    "Islands of Adventure - Universal Orlando Resort",
+    "Universal",
+  ),
+  entry(
+    UniversalVolcanoBay,
+    "UniversalVolcanoBay",
+    "Volcano Bay - Universal Orlando Resort",
+    "Universal",
   ),
 ];
 

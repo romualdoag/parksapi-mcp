@@ -1,39 +1,32 @@
 # parksapi-mcp
 
-Generic MCP server over [`@themeparks/parksapi`](https://github.com/ThemeParks/parksapi) —
-every destination the library supports (80+ theme parks worldwide), no per-park code,
-**plus** the Orlando parks the library can't serve without app credentials —
-4x Walt Disney World and 4x Universal Orlando Resort — via the public
-[`api.themeparks.wiki`](https://www.themeparks.wiki/api) APIs
-(see `src/hosted.ts`).
+Generic MCP server over [`@themeparks/parksapi`](https://github.com/ThemeParks/parksapi) — every destination the library supports (80+ theme parks worldwide) with no per-park code, **plus** the 8 Orlando parks the library can't serve without app credentials, via the public [`api.themeparks.wiki`](https://www.themeparks.wiki/api) APIs (see `src/hosted.ts`).
 
 ## Tools
 
-| Tool | Description |
-|---|---|
-| `list_destinations` | All destination ids (`{category?}` filter) |
-| `list_categories` | All categories |
-| `get_destination` | Details for one destination id |
-| `get_entities` | Entities (rides, shows, restaurants…) `{destination, entityType?, limit?}` |
-| `get_live_data` | Live wait times / statuses `{destination, entityId?, limit?}` |
-| `get_schedules` | Operating hours / show times `{destination, entityId?, limit?}` |
+| Tool | Description | Input |
+|---|---|---|
+| `list_destinations` | All destination ids (id, name, category) | `{category?}` |
+| `list_categories` | All categories for filtering | — |
+| `get_destination` | Details for one destination id | `{destination}` |
+| `get_entities` | Entities (rides, shows, restaurants…) with hierarchy resolved | `{destination, entityType?, limit?}` |
+| `get_live_data` | Live wait times / statuses / queues | `{destination, entityId?, limit?}` |
+| `get_schedules` | Operating hours / show times | `{destination, entityId?, limit?}` |
+
+All tools return JSON as text. `entityType` filters e.g. `ATTRACTION`, `SHOW`, `RESTAURANT`. `entityId` matches `entry.id` or `entry.entityId`. `limit` caps returned items (default: all).
+
+## Requirements
+
+Node 24+.
 
 ## Run
 
-Requires Node 24+.
-
 ```bash
-npm run setup:upstream   # install + build vendored lib (once per clone)
+npm run setup:upstream   # once per clone: install + build vendored lib
 npm install
 npm run build
-npm start          # stdio MCP server
+npm start                # stdio MCP server
 ```
-
-`upstream/` is a snapshot of
-[ThemeParks/parksapi](https://github.com/ThemeParks/parksapi) (`2460a5e`).
-Refresh it with: `rm -rf upstream && git clone --depth 1
-https://github.com/ThemeParks/parksapi.git upstream && rm -rf upstream/.git
-&& npm run setup:upstream`.
 
 Claude Desktop / Hermes config:
 
@@ -49,48 +42,51 @@ Claude Desktop / Hermes config:
 }
 ```
 
-## Tests (vitest, 29 testes)
+## Orlando parks (no credentials needed)
 
-```bash
-npm test   # build + suite completa
-```
+The TS library leaves Walt Disney World out of scope (Disney locked down the direct facility-service API) and covers Universal Orlando only with app-extracted API keys (without them `universalorlando` fails with `Invalid URL`). This server fills the gap with 8 native destinations (same `get_entities` / `get_live_data` / `get_schedules` interface, no credentials):
 
-- `tests/service.test.ts` — helpers e registry (offline)
-- `tests/hosted.test.ts` — mapeamento WDW + registry (offline, fetch stubado)
-- `tests/live.test.ts` — Efteling ao vivo (sem credenciais)
-- `tests/protocol.test.ts` — servidor real via JSON-RPC stdio
+| Park | `destination` | Source |
+|---|---|---|
+| Magic Kingdom | `waltdisneyworldmagickingdom` | preview collector |
+| EPCOT | `waltdisneyworldepcot` | preview collector |
+| Hollywood Studios | `waltdisneyworldhollywoodstudios` | preview collector |
+| Animal Kingdom | `waltdisneyworldanimalkingdom` | preview collector |
+| Universal Studios Florida | `universalstudiosflorida` | preview collector |
+| Islands of Adventure | `universalislandsofadventure` | preview collector |
+| Volcano Bay | `universalvolcanobay` | preview collector |
+| Epic Universe | `universalepicuniverse` | v1 live + schedule API |
 
-## Orlando hospedado (sem credenciais)
+7 parks read `https://api.themeparks.wiki/preview/parks/<ParkAPIID>/{waittime,calendar}` (the `HostedPark` pattern from the legacy JS library). Epic Universe has no ParkAPIID in the preview feed (404), so it reads the v1 live API (`universalresort_orlando/live` filtered by Epic parkId) plus the v1 schedule endpoint.
 
-Oito destinations extras via APIs públicas do ThemeParks.wiki
-(preview `.../preview/parks/...` para 7 parks, padrão `HostedPark` da lib legada;
-v1 `.../v1/entity/...` para o Epic Universe, que não tem ParkAPIID no preview).
-A lib TS deixa WDW fora de escopo e só cobre a Universal com chaves de app
-(sem elas, `universalorlando` retorna `Invalid URL`) — por isso servimos aqui:
-
-| Park | `destination` |
-|---|---|
-| Magic Kingdom | `waltdisneyworldmagickingdom` |
-| Epcot | `waltdisneyworldepcot` |
-| Hollywood Studios | `waltdisneyworldhollywoodstudios` |
-| Animal Kingdom | `waltdisneyworldanimalkingdom` |
-| Universal Studios Florida | `universalstudiosflorida` |
-| Islands of Adventure | `universalislandsofadventure` |
-| Volcano Bay | `universalvolcanobay` |
-| Epic Universe | `universalepicuniverse` |
-
-`get_entities`, `get_live_data` e `get_schedules` funcionam igual aos outros parks.
-Para adicionar mais parks hospedados (ex. Disneyland California, Hong Kong),
-basta uma entrada em `HOSTED_DESTINATIONS` (`src/hosted.ts`).
+To add more hosted parks (e.g. Disneyland California), add one entry to `HOSTED_DESTINATIONS` in `src/hosted.ts`.
 
 ## Credentials
 
-Most destinations need upstream API credentials via env vars (see the
-[parksapi docs](https://github.com/ThemeParks/parksapi)); `efteling` works
-without any. Copy `.env.example` to `.env` if running outside an MCP host.
+Most library-backed destinations need upstream API credentials as env vars (see the [parksapi docs](https://github.com/ThemeParks/parksapi)). Public ones such as `efteling` and all 8 Orlando hosted parks work with no credentials.
+
+## Tests (vitest, 29 tests)
+
+```bash
+npm test   # build + full suite
+```
+
+- `tests/service.test.ts` — registry/helpers (offline)
+- `tests/hosted.test.ts` — WDW + Universal mapping, Epic v1 fallback, registry (offline, stubbed fetch)
+- `tests/live.test.ts` — Efteling live (no credentials)
+- `tests/protocol.test.ts` — real server over JSON-RPC stdio
 
 ## Examples
 
-- `list_destinations` → find `id: "universalorlando"`
-- `get_live_data {destination: "universalorlando"}` → wait times for Epic Universe & co.
+- `list_destinations` → browse ids (`efteling`, `waltdisneyworldmagickingdom`, `universalepicuniverse`…)
+- `get_live_data {destination: "waltdisneyworldmagickingdom"}` → Magic Kingdom wait times
+- `get_live_data {destination: "universalepicuniverse"}` → Epic Universe wait times (v1-backed)
 - `get_schedules {destination: "efteling"}` → operating hours
+
+## Upstream
+
+`upstream/` is a snapshot of [ThemeParks/parksapi](https://github.com/ThemeParks/parksapi) (`2460a5e`). Refresh it with:
+
+```bash
+rm -rf upstream && git clone --depth 1 https://github.com/ThemeParks/parksapi.git upstream && rm -rf upstream/.git && npm run setup:upstream
+```

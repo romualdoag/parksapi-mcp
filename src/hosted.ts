@@ -8,10 +8,11 @@
  * serves these parks as "HostedPark" shims over the public collector
  * endpoint https://api.themeparks.wiki/preview/parks/<ParkAPIID>/{waittime,calendar/}.
  *
- * This module ports that HostedPark pattern into the MCP as seven native
- * Destination subclasses (4x WDW + 3x Universal Orlando Resort), so the
- * existing get_entities / get_live_data / get_schedules tools work
- * unchanged. No credentials needed — the preview API is public.
+ * This module ports that HostedPark pattern into the MCP as eight native
+ * Destination subclasses (4x WDW + 3x Universal Orlando Resort via the
+ * preview collector, plus Epic Universe via the v1 live API — the preview
+ * feed has no Epic ParkAPIID), so the existing get_entities / get_live_data
+ * / get_schedules tools work unchanged. No credentials needed.
  */
 import {
   Destination,
@@ -86,8 +87,21 @@ export function __clearHostedCache(): void {
   cache.clear();
 }
 
+const V1_BASE = "https://api.themeparks.wiki/v1";
+const UOR_LIVE_SLUG = "universalresort_orlando";
+export const EPIC_PARK_ID = "12dbb85b-265f-44e6-bccf-f1faa17211fc";
+
 async function fetchPreview<T>(path: string, ttlMs: number): Promise<T> {
   const url = `${PREVIEW_BASE}/${path}`;
+  return fetchCached<T>(url, `Preview API ${path}`, ttlMs);
+}
+
+async function fetchV1<T>(path: string, ttlMs: number): Promise<T> {
+  const url = `${V1_BASE}/${path}`;
+  return fetchCached<T>(url, `v1 API ${path}`, ttlMs);
+}
+
+async function fetchCached<T>(url: string, label: string, ttlMs: number): Promise<T> {
   const now = Date.now();
   const hit = cache.get(url);
   if (hit && hit.expires > now) return hit.data as T;
@@ -95,7 +109,7 @@ async function fetchPreview<T>(path: string, ttlMs: number): Promise<T> {
   const timer = setTimeout(() => ctrl.abort(), 25_000);
   try {
     const resp = await fetchFn(url, { signal: ctrl.signal });
-    if (!resp.ok) throw new Error(`Preview API ${resp.status} for ${path}`);
+    if (!resp.ok) throw new Error(`${label}: ${resp.status} for ${url}`);
     const data = (await resp.json()) as T;
     cache.set(url, { expires: now + ttlMs, data });
     return data;
@@ -368,6 +382,101 @@ export class UniversalVolcanoBay extends HostedCollectorPark {
   };
 }
 
+type V1LiveRow = {
+  id: string;
+  name: string;
+  entityType?: string;
+  parkId?: string;
+  status?: string;
+  queue?: unknown;
+  lastUpdated?: string;
+  operatingHours?: unknown;
+};
+
+type V1LiveResponse = { liveData?: V1LiveRow[] };
+type V1ScheduleResponse = {
+  id?: string;
+  name?: string;
+  schedule?: Record<string, unknown>[];
+};
+
+/**
+ * Epic Universe — v1-backed hosted destination.
+ *
+ * The preview collector feed has no Epic ParkAPIID (404 for every candidate),
+ * so unlike the other hosted Orlando parks this one reads the same v1 API
+ * the direct fallback uses: live rows from
+ * /v1/entity/universalresort_orlando/live filtered by Epic's parkId, and
+ * hours from /v1/entity/<epicParkId>/schedule. No credentials needed.
+ */
+export class UniversalEpicUniverse extends Destination {
+  readonly hostedId = "universalepicuniverse";
+  readonly parkId = `${"universalepicuniverse"}park`;
+  readonly epicParkId = EPIC_PARK_ID;
+  readonly timezone = ORLANDO_TZ;
+
+  constructor(options?: DestinationConstructor) {
+    super(options);
+  }
+
+  protected async fetchEpicLive(): Promise<V1LiveRow[]> {
+    const data = await fetchV1<V1LiveResponse>(`entity/${UOR_LIVE_SLUG}/live`, 60_000);
+    const rows = Array.isArray(data.liveData) ? data.liveData : [];
+    return rows.filter((r) => r.parkId === EPIC_PARK_ID);
+  }
+
+  async getDestinations(): Promise<Entity[]> {
+    return [
+      {
+        id: this.hostedId,
+        name: "Epic Universe - Universal Orlando Resort",
+        entityType: "DESTINATION",
+        timezone: this.timezone,
+        location: { latitude: 28.4416, longitude: -81.4709 },
+      } as unknown as Entity,
+    ];
+  }
+
+  protected async buildEntityList(): Promise<Entity[]> {
+    const parkEntity = {
+      id: this.parkId,
+      name: "Universal Epic Universe",
+      entityType: "PARK",
+      parentId: this.hostedId,
+      destinationId: this.hostedId,
+      timezone: this.timezone,
+      location: { latitude: 28.4416, longitude: -81.4709 },
+    } as unknown as Entity;
+    const rows = await this.fetchEpicLive();
+    const entities = rows.map(
+      (r) =>
+        ({
+          id: r.id,
+          name: r.name,
+          entityType: r.entityType ?? "ATTRACTION",
+          parentId: this.parkId,
+          destinationId: this.hostedId,
+          timezone: this.timezone,
+        }) as unknown as Entity,
+    );
+    return [parkEntity, ...entities];
+  }
+
+  protected async buildLiveData(): Promise<LiveData[]> {
+    const rows = await this.fetchEpicLive();
+    return rows as unknown as LiveData[];
+  }
+
+  protected async buildSchedules(): Promise<EntitySchedule[]> {
+    const data = await fetchV1<V1ScheduleResponse>(
+      `entity/${EPIC_PARK_ID}/schedule`,
+      12 * 3_600_000,
+    );
+    const schedule = Array.isArray(data.schedule) ? data.schedule : [];
+    return [{ id: this.parkId, schedule } as unknown as EntitySchedule];
+  }
+}
+
 export type HostedRegistryEntry = {
   id: string;
   name: string;
@@ -386,9 +495,10 @@ function entry(
 
 /**
  * Collector-fed Orlando parks: the four Walt Disney World parks plus the
- * three Universal Orlando Resort parks (Studios, Islands, Volcano Bay).
+ * four Universal Orlando Resort parks (Studios, Islands, Volcano Bay via the
+ * preview collector; Epic Universe via the v1 live API).
  * The upstream TS library covers neither group without app credentials,
- * so both are served via the public collector API here.
+ * so both are served via the public ThemeParks.wiki APIs here.
  */
 export const HOSTED_DESTINATIONS: HostedRegistryEntry[] = [
   entry(
@@ -433,6 +543,12 @@ export const HOSTED_DESTINATIONS: HostedRegistryEntry[] = [
     "Volcano Bay - Universal Orlando Resort",
     "Universal",
   ),
+  {
+    id: "universalepicuniverse",
+    name: "Epic Universe - Universal Orlando Resort",
+    category: "Universal",
+    DestinationClass: UniversalEpicUniverse,
+  },
 ];
 
 export const HOSTED_BY_ID = new Map<string, HostedRegistryEntry>(

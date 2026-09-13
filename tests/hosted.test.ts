@@ -69,9 +69,51 @@ const CALENDAR_FIXTURE = {
   ],
 };
 
+const V1_LIVE_FIXTURE = {
+  liveData: [
+    {
+      id: "stardust-id",
+      name: "Stardust Racers",
+      entityType: "ATTRACTION",
+      parkId: "12dbb85b-265f-44e6-bccf-f1faa17211fc",
+      status: "OPERATING",
+      queue: { STANDBY: { waitTime: 10 } },
+      lastUpdated: "2026-09-13T12:50:51.067Z",
+    },
+    {
+      id: "other-park-ride",
+      name: "Not Epic Ride",
+      entityType: "ATTRACTION",
+      parkId: "eb3f4560-2383-4a36-9152-6b3e5ed6bc57",
+      status: "OPERATING",
+      queue: { STANDBY: { waitTime: 5 } },
+      lastUpdated: "2026-09-13T12:50:51.067Z",
+    },
+  ],
+};
+
+const V1_SCHEDULE_FIXTURE = {
+  id: "12dbb85b-265f-44e6-bccf-f1faa17211fc",
+  name: "Universal Epic Universe",
+  schedule: [
+    {
+      date: "2026-09-13",
+      type: "OPERATING",
+      openingTime: "2026-09-13T10:00:00-04:00",
+      closingTime: "2026-09-13T20:00:00-04:00",
+    },
+  ],
+};
+
 function stubFetch() {
   __clearHostedCache();
   __setHostedFetch(async (url: string) => {
+    if (url.includes("/v1/entity/") && url.endsWith("/live")) {
+      return { ok: true, status: 200, json: async () => V1_LIVE_FIXTURE };
+    }
+    if (url.includes("/v1/entity/") && url.includes("/schedule")) {
+      return { ok: true, status: 200, json: async () => V1_SCHEDULE_FIXTURE };
+    }
     const body = url.includes("/calendar/")
       ? CALENDAR_FIXTURE
       : WAITTIME_FIXTURE;
@@ -159,21 +201,22 @@ describe("hosted registry wiring", () => {
     }
   });
 
-  it("exposes the three Universal Orlando Resort parks", () => {
+  it("exposes the four Universal Orlando Resort parks", () => {
     const ids = new Set(HOSTED_DESTINATIONS.map((d) => d.id));
     for (const id of [
       "universalstudiosflorida",
       "universalislandsofadventure",
       "universalvolcanobay",
+      "universalepicuniverse",
     ]) {
       expect(ids.has(id)).toBe(true);
     }
     for (const d of HOSTED_DESTINATIONS.filter((x) =>
-      ["universalstudiosflorida", "universalislandsofadventure", "universalvolcanobay"].includes(x.id),
+      ["universalstudiosflorida", "universalislandsofadventure", "universalvolcanobay", "universalepicuniverse"].includes(x.id),
     )) {
       expect(d.category).toBe("Universal");
     }
-    expect(HOSTED_DESTINATIONS).toHaveLength(7);
+    expect(HOSTED_DESTINATIONS).toHaveLength(8);
   });
 
   it("lists them via listDestinations + Disney filter", async () => {
@@ -189,6 +232,7 @@ describe("hosted registry wiring", () => {
     expect(uids.has("universalstudiosflorida")).toBe(true);
     expect(uids.has("universalislandsofadventure")).toBe(true);
     expect(uids.has("universalvolcanobay")).toBe(true);
+    expect(uids.has("universalepicuniverse")).toBe(true);
     expect(uids.has("universalorlando")).toBe(true);
   });
 
@@ -223,5 +267,23 @@ describe("hosted registry wiring", () => {
     expect(live.length).toBe(4);
     const schedules = await park.getSchedules();
     expect(schedules.length).toBe(1);
+  });
+
+  it("builds Epic Universe from the v1 API (stubbed, filters by parkId)", async () => {
+    const d = await getDestination("universalepicuniverse");
+    expect(d.id).toBe("universalepicuniverse");
+    expect(d.category).toBe("Universal");
+    const park = await getInstance("universalepicuniverse");
+    const entities = await park.getEntities();
+    // DESTINATION + PARK + 1 epic row (the other-park row is filtered out)
+    expect(entities.length).toBe(3);
+    expect((entities[2] as any).name).toBe("Stardust Racers");
+    const live = await park.getLiveData();
+    expect(live.length).toBe(1);
+    expect((live[0] as any).name).toBe("Stardust Racers");
+    expect((live[0] as any).queue).toEqual({ STANDBY: { waitTime: 10 } });
+    const schedules = await park.getSchedules();
+    expect(schedules.length).toBe(1);
+    expect((schedules[0] as any).schedule.length).toBe(1);
   });
 });

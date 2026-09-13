@@ -3,8 +3,8 @@
 Generic MCP server over [`@themeparks/parksapi`](https://github.com/ThemeParks/parksapi) —
 every destination the library supports (80+ theme parks worldwide), no per-park code,
 **plus** the Orlando parks the library can't serve without app credentials —
-4x Walt Disney World and 3x Universal Orlando Resort — via the public
-[`api.themeparks.wiki`](https://www.themeparks.wiki/api) collector feed
+4x Walt Disney World and 4x Universal Orlando Resort — via the public
+[`api.themeparks.wiki`](https://www.themeparks.wiki/api) APIs
 (see `src/hosted.ts`).
 
 ## Tools
@@ -49,7 +49,7 @@ Claude Desktop / Hermes config:
 }
 ```
 
-## Tests (vitest, 28 testes)
+## Tests (vitest, 29 testes)
 
 ```bash
 npm test   # build + suite completa
@@ -62,8 +62,9 @@ npm test   # build + suite completa
 
 ## Orlando hospedado (sem credenciais)
 
-Sete destinations extras via feed público do coletor
-(`api.themeparks.wiki/preview/parks/...`, padrão `HostedPark` da lib legada).
+Oito destinations extras via APIs públicas do ThemeParks.wiki
+(preview `.../preview/parks/...` para 7 parks, padrão `HostedPark` da lib legada;
+v1 `.../v1/entity/...` para o Epic Universe, que não tem ParkAPIID no preview).
 A lib TS deixa WDW fora de escopo e só cobre a Universal com chaves de app
 (sem elas, `universalorlando` retorna `Invalid URL`) — por isso servimos aqui:
 
@@ -76,6 +77,7 @@ A lib TS deixa WDW fora de escopo e só cobre a Universal com chaves de app
 | Universal Studios Florida | `universalstudiosflorida` |
 | Islands of Adventure | `universalislandsofadventure` |
 | Volcano Bay | `universalvolcanobay` |
+| Epic Universe | `universalepicuniverse` |
 
 `get_entities`, `get_live_data` e `get_schedules` funcionam igual aos outros parks.
 Para adicionar mais parks hospedados (ex. Disneyland California, Hong Kong),

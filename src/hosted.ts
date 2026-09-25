@@ -135,9 +135,9 @@ export function mapPreviewStatus(status: unknown, active: unknown): string {
   return STATUS_MAP[status.trim().toLowerCase()] ?? "CLOSED";
 }
 
-/** Strip the "<ParkAPIID>_" prefix the collector prepends to some ids. */
+/** Strip the "<ParkAPIID>_" prefix the collector prepends to some ids (split on the LAST '_' so ids containing '_' survive). */
 export function normalizeEntityId(rawId: string): string {
-  const idx = rawId.indexOf("_");
+  const idx = rawId.lastIndexOf("_");
   return idx >= 0 ? rawId.slice(idx + 1) : rawId;
 }
 

@@ -135,6 +135,7 @@ describe("MCP protocol", () => {
         },
       ]);
       const call = msgs.find((m) => m.id === 4);
+      expect(call?.result?.isError).toBe(true);
       const text: string =
         call?.error?.message ?? call?.result?.content?.[0]?.text ?? JSON.stringify(call);
       expect(text).toMatch(/Unknown destination/);

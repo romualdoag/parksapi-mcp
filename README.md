@@ -13,11 +13,19 @@ Generic MCP server over [`@themeparks/parksapi`](https://github.com/ThemeParks/p
 | `get_live_data` | Live wait times / statuses / queues | `{destination, entityId?, limit?}` |
 | `get_schedules` | Operating hours / show times | `{destination, entityId?, limit?}` |
 
-All tools return JSON as text. `entityType` filters e.g. `ATTRACTION`, `SHOW`, `RESTAURANT`. `entityId` matches `entry.id` or `entry.entityId`. `limit` caps returned items (default: all).
+All tools return JSON as text. `entityType` filters e.g. `ATTRACTION`, `SHOW`, `RESTAURANT` (case-insensitive). `entityId` matches `entry.id` or `entry.entityId`. `limit` caps returned items (omitted: all; via MCP it must be a positive int — direct `withLimit(arr, 0)` also means "all"). `category` in `list_destinations` is case-insensitive (`disney` == `Disney`). Unknown destinations return a tool result with `isError: true` (plain message, no protocol error).
 
 ## Requirements
 
-Node 24+.
+Node 22+.
+
+## Cache
+
+The vendored upstream library keeps a SQLite cache at `./cache.sqlite` (plus `-shm`/`-wal`) in the server's working directory — override with `CACHE_DB_PATH` (e.g. `CACHE_DB_PATH="$TMPDIR/parksapi-cache.sqlite"`). The files are git-ignored; wipe them with:
+
+```bash
+npm run clean
+```
 
 ## Run
 
@@ -65,7 +73,7 @@ To add more hosted parks (e.g. Disneyland California), add one entry to `HOSTED_
 
 Most library-backed destinations need upstream API credentials as env vars (see the [parksapi docs](https://github.com/ThemeParks/parksapi)). Public ones such as `efteling` and all 8 Orlando hosted parks work with no credentials.
 
-## Tests (vitest, 29 tests)
+## Tests (vitest, 32 tests)
 
 ```bash
 npm test   # build + full suite

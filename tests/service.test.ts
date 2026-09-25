@@ -31,6 +31,14 @@ describe("withLimit", () => {
     expect(r.truncated).toBe(false);
     expect(r.data).toEqual([1, 2]);
   });
+
+  it("treats 0 / negative / NaN as unlimited (schema enforces positive via MCP)", () => {
+    for (const limit of [0, -3, NaN]) {
+      const r = withLimit([1, 2, 3], limit);
+      expect(r.truncated).toBe(false);
+      expect(r.data).toEqual([1, 2, 3]);
+    }
+  });
 });
 
 describe("matchesEntity", () => {
@@ -71,6 +79,16 @@ describe("registry", () => {
   it("lists categories", async () => {
     const cats = await listCategories();
     expect(cats.length).toBeGreaterThan(0);
+  });
+
+  it("filters by category case-insensitively ('disney' == 'Disney')", async () => {
+    const upper = await listDestinations("Disney");
+    const lower = await listDestinations("disney");
+    expect(lower.length).toBeGreaterThan(0);
+    expect(new Set(lower.map((d) => d.id))).toEqual(
+      new Set(upper.map((d) => d.id)),
+    );
+    expect(lower.some((d) => d.id === "waltdisneyworldmagickingdom")).toBe(true);
   });
 
   it("describes a destination", async () => {

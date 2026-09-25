@@ -6,7 +6,6 @@ import {
   getAllDestinations,
   getAllCategories,
   getDestinationById,
-  getDestinationsByCategory,
 } from "@themeparks/parksapi";
 import { HOSTED_BY_ID, HOSTED_DESTINATIONS } from "./hosted.js";
 
@@ -34,7 +33,9 @@ export async function getInstance(destination: string) {
 }
 
 export function withLimit<T>(arr: T[], limit?: number) {
-  if (limit === undefined || limit <= 0) {
+  // limit <= 0 / NaN / undefined = all (MCP schema enforces positive,
+  // so 0 never reaches the service via tools — direct callers get "all").
+  if (limit === undefined || !(limit > 0)) {
     return { count: arr.length, truncated: false as const, data: arr };
   }
   return {
@@ -50,9 +51,12 @@ export function matchesEntity(entry: Record<string, unknown>, entityId?: string)
 }
 
 export async function listDestinations(category?: string) {
+  // Case-insensitive on both sides: upstream getDestinationsByCategory is
+  // exact-match ('disney' ≠ 'Disney'), so filter the full registry here.
+  const all = await getAllDestinations();
   const list = category
-    ? await getDestinationsByCategory(category)
-    : await getAllDestinations();
+    ? all.filter((d) => matchesCategory(d.category as string | string[] | undefined, category))
+    : all;
   const base = list.map((d) => ({ id: d.id, name: d.name, category: d.category }));
   const hosted = HOSTED_DESTINATIONS.filter(
     (d) => !category || matchesCategory(d.category, category),
@@ -100,7 +104,10 @@ export async function getEntities(
   const park = await getInstance(destination);
   let entities = await park.getEntities();
   if (opts.entityType) {
-    entities = entities.filter((e) => e.entityType === opts.entityType);
+    const wanted = opts.entityType.toUpperCase();
+    entities = entities.filter(
+      (e) => String(e.entityType).toUpperCase() === wanted,
+    );
   }
   return {
     destination,

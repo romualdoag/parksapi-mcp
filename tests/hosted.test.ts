@@ -10,7 +10,7 @@ import {
   mapPreviewStatus,
   normalizeEntityId,
 } from "../src/hosted.js";
-import { getDestination, getInstance, listDestinations } from "../src/service.js";
+import { getDestination, getEntities, getInstance, listDestinations } from "../src/service.js";
 
 const WAITTIME_FIXTURE = {
   attractions: [
@@ -139,6 +139,8 @@ describe("preview API mapping", () => {
   it("normalizes entity ids", () => {
     expect(normalizeEntityId("WaltDisneyWorldMagicKingdom_16491297")).toBe("16491297");
     expect(normalizeEntityId("some-uuid")).toBe("some-uuid");
+    // ids containing '_' keep everything after the LAST underscore
+    expect(normalizeEntityId("ParkA_zone_1_42")).toBe("42");
   });
 
   it("maps entities with hierarchy + location", () => {
@@ -285,5 +287,17 @@ describe("hosted registry wiring", () => {
     const schedules = await park.getSchedules();
     expect(schedules.length).toBe(1);
     expect((schedules[0] as any).schedule.length).toBe(1);
+  });
+
+  it("filters entityType case-insensitively (stubbed)", async () => {
+    const upper = await getEntities("waltdisneyworldmagickingdom", {
+      entityType: "ATTRACTION",
+    });
+    const lower = await getEntities("waltdisneyworldmagickingdom", {
+      entityType: "attraction",
+    });
+    expect(lower.data.length).toBeGreaterThan(0);
+    expect(lower.data.length).toBe(upper.data.length);
+    for (const e of lower.data) expect(e.entityType).toBe("ATTRACTION");
   });
 });

@@ -29,10 +29,35 @@ type TextResult = {
   content: [{ type: "text"; text: string }];
 };
 
+type ErrorResult = {
+  content: [{ type: "text"; text: string }];
+  isError: true;
+};
+
 function asText(obj: unknown): TextResult {
   return {
     content: [{ type: "text", text: JSON.stringify(obj, null, 2) }],
   };
+}
+
+function asError(err: unknown): ErrorResult {
+  return {
+    content: [
+      { type: "text", text: err instanceof Error ? err.message : String(err) },
+    ],
+    isError: true,
+  };
+}
+
+/** Run a tool handler: success → JSON text, throw → isError result (no protocol error). */
+async function safe(
+  fn: () => Promise<unknown>,
+): Promise<TextResult | ErrorResult> {
+  try {
+    return asText(await fn());
+  } catch (err) {
+    return asError(err);
+  }
 }
 
 const destinationParam = z
@@ -45,7 +70,7 @@ const limitParam = z
   .int()
   .positive()
   .optional()
-  .describe("Max items to return (default: all).");
+  .describe("Max items to return (default/omitted: all; must be positive when given).");
 const entityIdParam = z
   .string()
   .optional()
@@ -57,10 +82,10 @@ server.registerTool(
     description:
       "List all theme-park destinations the library supports (id, name, category). Optionally filter by category.",
     inputSchema: {
-      category: z.string().optional().describe("Filter by category, e.g. 'Universal'. See list_categories."),
+      category: z.string().optional().describe("Filter by category, e.g. 'Universal' (case-insensitive). See list_categories."),
     },
   },
-  async ({ category }) => asText(await listDestinations(category)),
+  async ({ category }) => safe(() => listDestinations(category)),
 );
 
 server.registerTool(
@@ -69,7 +94,7 @@ server.registerTool(
     description: "List all destination categories for filtering list_destinations.",
     inputSchema: {},
   },
-  async () => asText(await listCategories()),
+  async () => safe(() => listCategories()),
 );
 
 server.registerTool(
@@ -79,7 +104,7 @@ server.registerTool(
       "Get details for one destination: id, name, category and the data available (entities, live data, schedules).",
     inputSchema: { destination: destinationParam },
   },
-  async ({ destination }) => asText(await getDestination(destination)),
+  async ({ destination }) => safe(() => getDestination(destination)),
 );
 
 server.registerTool(
@@ -92,12 +117,12 @@ server.registerTool(
       entityType: z
         .string()
         .optional()
-        .describe("Filter by type, e.g. 'ATTRACTION', 'SHOW', 'RESTAURANT'."),
+        .describe("Filter by type, e.g. 'ATTRACTION', 'SHOW', 'RESTAURANT' (case-insensitive)."),
       limit: limitParam,
     },
   },
   async ({ destination, entityType, limit }) =>
-    asText(await getEntities(destination, { entityType, limit })),
+    safe(() => getEntities(destination, { entityType, limit })),
 );
 
 server.registerTool(
@@ -108,7 +133,7 @@ server.registerTool(
     inputSchema: { destination: destinationParam, entityId: entityIdParam, limit: limitParam },
   },
   async ({ destination, entityId, limit }) =>
-    asText(await getLiveData(destination, { entityId, limit })),
+    safe(() => getLiveData(destination, { entityId, limit })),
 );
 
 server.registerTool(
@@ -119,7 +144,7 @@ server.registerTool(
     inputSchema: { destination: destinationParam, entityId: entityIdParam, limit: limitParam },
   },
   async ({ destination, entityId, limit }) =>
-    asText(await getSchedules(destination, { entityId, limit })),
+    safe(() => getSchedules(destination, { entityId, limit })),
 );
 
 await server.connect(new StdioServerTransport());

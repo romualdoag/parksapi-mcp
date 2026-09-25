@@ -5,7 +5,7 @@
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=24"
+    "node": ">=22"
   },
   "bin": {
     "parksapi-mcp": "dist/index.js"
@@ -13,6 +13,7 @@
   "scripts": {
     "setup:upstream": "npm --prefix upstream install --no-audit --no-fund && npm --prefix upstream run build",
     "build": "tsc",
+    "clean": "rm -f cache.sqlite cache.sqlite-shm cache.sqlite-wal",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "test": "npm run build && vitest run"

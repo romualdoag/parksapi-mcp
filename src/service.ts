@@ -35,6 +35,8 @@ export async function getInstance(destination: string) {
 export function withLimit<T>(arr: T[], limit?: number) {
   // limit <= 0 / NaN / undefined = all (MCP schema enforces positive,
   // so 0 never reaches the service via tools — direct callers get "all").
+  // NOTE: withLimit itself stays pure (undefined = all); the DEFAULT_LIMIT
+  // below is applied by getEntities/getLiveData/getSchedules, not here.
   if (limit === undefined || !(limit > 0)) {
     return { count: arr.length, truncated: false as const, data: arr };
   }
@@ -44,6 +46,13 @@ export function withLimit<T>(arr: T[], limit?: number) {
     data: arr.slice(0, limit),
   };
 }
+
+/**
+ * Default page size for get_entities / get_live_data / get_schedules when
+ * the caller omits `limit`. Caps payloads so a single call can't dump
+ * thousands of rows; pass an explicit `limit` to override.
+ */
+export const DEFAULT_LIMIT = 50;
 
 export function matchesEntity(entry: Record<string, unknown>, entityId?: string) {
   if (!entityId) return true;
@@ -112,7 +121,7 @@ export async function getEntities(
   return {
     destination,
     entityType: opts.entityType ?? "all",
-    ...withLimit(entities, opts.limit),
+    ...withLimit(entities, opts.limit ?? DEFAULT_LIMIT),
   };
 }
 
@@ -128,7 +137,7 @@ export async function getLiveData(
   return {
     destination,
     entityId: opts.entityId ?? "all",
-    ...withLimit(filtered, opts.limit),
+    ...withLimit(filtered, opts.limit ?? DEFAULT_LIMIT),
   };
 }
 
@@ -136,6 +145,9 @@ export async function getSchedules(
   destination: string,
   opts: { entityId?: string; limit?: number } = {},
 ) {
+  // NOTE: hosted Orlando parks expose park-level hours only (single entry
+  // keyed by '<destination>park'); filtering by an attraction id yields
+  // no rows — filter by the park id or omit entityId.
   const park = await getInstance(destination);
   const schedules = await park.getSchedules();
   const filtered = schedules.filter((e) =>
@@ -144,6 +156,6 @@ export async function getSchedules(
   return {
     destination,
     entityId: opts.entityId ?? "all",
-    ...withLimit(filtered, opts.limit),
+    ...withLimit(filtered, opts.limit ?? DEFAULT_LIMIT),
   };
 }

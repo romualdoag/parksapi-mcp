@@ -13,7 +13,7 @@ Generic MCP server over [`@themeparks/parksapi`](https://github.com/ThemeParks/p
 | `get_live_data` | Live wait times / statuses / queues | `{destination, entityId?, limit?}` |
 | `get_schedules` | Operating hours / show times | `{destination, entityId?, limit?}` |
 
-All tools return JSON as text. `entityType` filters e.g. `ATTRACTION`, `SHOW`, `RESTAURANT` (case-insensitive). `entityId` matches `entry.id` or `entry.entityId`. `limit` caps returned items (omitted: all; via MCP it must be a positive int — direct `withLimit(arr, 0)` also means "all"). `category` in `list_destinations` is case-insensitive (`disney` == `Disney`). Unknown destinations return a tool result with `isError: true` (plain message, no protocol error).
+All tools return JSON as text. `entityType` filters e.g. `ATTRACTION`, `SHOW`, `RESTAURANT` (case-insensitive). `entityId` matches `entry.id` or `entry.entityId`. `limit` caps returned items (default 50 when omitted; via MCP it must be a positive int — direct `withLimit(arr, 0)` also means "all"). `category` in `list_destinations` is case-insensitive (`disney` == `Disney`). Unknown destinations return a tool result with `isError: true` (plain message, no protocol error). All tools are read-only (`annotations.readOnlyHint: true`).
 
 ## Requirements
 
@@ -26,6 +26,8 @@ The vendored upstream library keeps a SQLite cache at `./cache.sqlite` (plus `-s
 ```bash
 npm run clean
 ```
+
+The hosted Orlando parks also keep a small in-memory TTL cache (60s for wait times/live, 12h for calendars) capped at 100 entries with LRU eviction.
 
 ## Run
 
@@ -67,13 +69,15 @@ The TS library leaves Walt Disney World out of scope (Disney locked down the dir
 
 7 parks read `https://api.themeparks.wiki/preview/parks/<ParkAPIID>/{waittime,calendar}` (the `HostedPark` pattern from the legacy JS library). Epic Universe has no ParkAPIID in the preview feed (404), so it reads the v1 live API (`universalresort_orlando/live` filtered by Epic parkId) plus the v1 schedule endpoint.
 
+Hosted `get_schedules` is park-level only: one entry keyed by the park entity (`<destination>park`, e.g. `waltdisneyworldmagickingdompark`). Filtering by an attraction id yields no rows — filter by the park id or omit `entityId`.
+
 To add more hosted parks (e.g. Disneyland California), add one entry to `HOSTED_DESTINATIONS` in `src/hosted.ts`.
 
 ## Credentials
 
 Most library-backed destinations need upstream API credentials as env vars (see the [parksapi docs](https://github.com/ThemeParks/parksapi)). Public ones such as `efteling` and all 8 Orlando hosted parks work with no credentials.
 
-## Tests (vitest, 32 tests)
+## Tests (vitest, 37 tests)
 
 ```bash
 npm test   # build + full suite

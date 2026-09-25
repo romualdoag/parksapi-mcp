@@ -2,15 +2,26 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
   HOSTED_DESTINATIONS,
+  HOSTED_CACHE_MAX_ENTRIES,
+  HostedCollectorPark,
   __setHostedFetch,
   __clearHostedCache,
+  __hostedCacheSize,
   mapAttractionToEntity,
   mapAttractionToLive,
   mapCalendarDayToEntries,
   mapPreviewStatus,
   normalizeEntityId,
 } from "../src/hosted.js";
-import { getDestination, getEntities, getInstance, listDestinations } from "../src/service.js";
+import {
+  DEFAULT_LIMIT,
+  getDestination,
+  getEntities,
+  getInstance,
+  getLiveData,
+  getSchedules,
+  listDestinations,
+} from "../src/service.js";
 
 const WAITTIME_FIXTURE = {
   attractions: [
@@ -299,5 +310,80 @@ describe("hosted registry wiring", () => {
     expect(lower.data.length).toBeGreaterThan(0);
     expect(lower.data.length).toBe(upper.data.length);
     for (const e of lower.data) expect(e.entityType).toBe("ATTRACTION");
+  });
+});
+
+describe("default limit", () => {
+  it("defaults to DEFAULT_LIMIT (50) when limit is omitted", async () => {
+    expect(DEFAULT_LIMIT).toBe(50);
+    // 60 attractions → default page is 50 with truncated=true, count=62 (destination + park + 60)
+    const big = {
+      attractions: Array.from({ length: 60 }, (_, i) => ({
+        id: `ride-${i}`,
+        name: `Ride ${i}`,
+        waitTime: 5,
+        status: "Operating",
+        active: true,
+        meta: { type: "ATTRACTION" },
+      })),
+    };
+    __clearHostedCache();
+    __setHostedFetch(async () => ({ ok: true, status: 200, json: async () => big }));
+    const r = await getEntities("waltdisneyworldmagickingdom");
+    expect(r.count).toBe(62);
+    expect(r.data).toHaveLength(50);
+    expect(r.truncated).toBe(true);
+  });
+
+  it("explicit limit overrides the default", async () => {
+    const live = await getLiveData("waltdisneyworldmagickingdom", { limit: 2 });
+    expect(live.data).toHaveLength(2);
+    expect(live.truncated).toBe(true);
+    const all = await getLiveData("waltdisneyworldmagickingdom", { limit: 1000 });
+    expect(all.truncated).toBe(false);
+    expect(all.data.length).toBe(all.count);
+  });
+});
+
+describe("hosted schedules entityId", () => {
+  it("returns the park entry without a filter and by park id, empty for attraction ids", async () => {
+    stubFetch();
+    const parkId = "waltdisneyworldmagickingdompark";
+    const all = await getSchedules("waltdisneyworldmagickingdom");
+    expect(all.count).toBe(1);
+    const byPark = await getSchedules("waltdisneyworldmagickingdom", { entityId: parkId });
+    expect(byPark.count).toBe(1);
+    const byRide = await getSchedules("waltdisneyworldmagickingdom", { entityId: "16491297" });
+    expect(byRide.count).toBe(0);
+    expect(byRide.data).toHaveLength(0);
+  });
+});
+
+describe("hosted cache LRU cap", () => {
+  it(`caps the cache at ${100} entries`, async () => {
+    __clearHostedCache();
+    __setHostedFetch(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ attractions: [] }),
+    }));
+    // Each distinct parkApiId produces a distinct cache URL.
+    for (let i = 0; i < HOSTED_CACHE_MAX_ENTRIES + 20; i++) {
+      const parkApiId = `EvictTest${i}`;
+      class FakePark extends HostedCollectorPark {
+        readonly parkDef = {
+          parkApiId,
+          name: `Fake ${i}`,
+          latitude: 0,
+          longitude: 0,
+          timezone: "America/New_York",
+          category: "Test",
+        };
+      }
+      const park = new FakePark();
+      await park.getLiveData();
+    }
+    expect(__hostedCacheSize()).toBeLessThanOrEqual(HOSTED_CACHE_MAX_ENTRIES);
+    expect(__hostedCacheSize()).toBe(HOSTED_CACHE_MAX_ENTRIES);
   });
 });

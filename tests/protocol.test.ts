@@ -105,6 +105,19 @@ describe("MCP protocol", () => {
   );
 
   it(
+    "all tools are annotated read-only",
+    async () => {
+      const msgs = await sendReceive([INIT, INITIALIZED, { jsonrpc: "2.0", id: 5, method: "tools/list" }]);
+      const list = msgs.find((m) => m.id === 5);
+      expect(list?.error).toBeUndefined();
+      for (const t of list?.result.tools as Array<{ name: string; annotations?: { readOnlyHint?: boolean } }>) {
+        expect(t.annotations?.readOnlyHint).toBe(true);
+      }
+    },
+    110_000,
+  );
+
+  it(
     "tools/call list_destinations returns the full registry",
     async () => {
       const msgs = await sendReceive([

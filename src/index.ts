@@ -70,7 +70,7 @@ const limitParam = z
   .int()
   .positive()
   .optional()
-  .describe("Max items to return (default/omitted: all; must be positive when given).");
+  .describe("Max items to return (default 50 when omitted; must be positive when given).");
 const entityIdParam = z
   .string()
   .optional()
@@ -84,6 +84,7 @@ server.registerTool(
     inputSchema: {
       category: z.string().optional().describe("Filter by category, e.g. 'Universal' (case-insensitive). See list_categories."),
     },
+    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   async ({ category }) => safe(() => listDestinations(category)),
 );
@@ -93,6 +94,7 @@ server.registerTool(
   {
     description: "List all destination categories for filtering list_destinations.",
     inputSchema: {},
+    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   async () => safe(() => listCategories()),
 );
@@ -103,6 +105,7 @@ server.registerTool(
     description:
       "Get details for one destination: id, name, category and the data available (entities, live data, schedules).",
     inputSchema: { destination: destinationParam },
+    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   async ({ destination }) => safe(() => getDestination(destination)),
 );
@@ -111,7 +114,7 @@ server.registerTool(
   "get_entities",
   {
     description:
-      "Get all entities (parks, rides, shows, restaurants, hotels) for a destination, with hierarchy resolved.",
+      "Get entities (parks, rides, shows, restaurants, hotels) for a destination, with hierarchy resolved. Returns the first 50 by default; pass limit to override.",
     inputSchema: {
       destination: destinationParam,
       entityType: z
@@ -120,6 +123,7 @@ server.registerTool(
         .describe("Filter by type, e.g. 'ATTRACTION', 'SHOW', 'RESTAURANT' (case-insensitive)."),
       limit: limitParam,
     },
+    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   async ({ destination, entityType, limit }) =>
     safe(() => getEntities(destination, { entityType, limit })),
@@ -129,8 +133,9 @@ server.registerTool(
   "get_live_data",
   {
     description:
-      "Get live data (wait times, statuses, queues) for a destination. Optionally filter to one entity.",
+      "Get live data (wait times, statuses, queues) for a destination. Optionally filter to one entity. Returns the first 50 by default; pass limit to override.",
     inputSchema: { destination: destinationParam, entityId: entityIdParam, limit: limitParam },
+    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   async ({ destination, entityId, limit }) =>
     safe(() => getLiveData(destination, { entityId, limit })),
@@ -140,8 +145,9 @@ server.registerTool(
   "get_schedules",
   {
     description:
-      "Get schedules (operating hours, show times) for a destination. Optionally filter to one entity.",
+      "Get schedules (operating hours, show times) for a destination. Optionally filter to one entity. Returns the first 50 by default; pass limit to override. Note: hosted Orlando parks expose park-level hours only (one entry keyed by the park entity, e.g. '<destination>park'); filtering by an attraction id yields no rows.",
     inputSchema: { destination: destinationParam, entityId: entityIdParam, limit: limitParam },
+    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   async ({ destination, entityId, limit }) =>
     safe(() => getSchedules(destination, { entityId, limit })),

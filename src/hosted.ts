@@ -62,6 +62,10 @@ export type HostedCalendarDay = {
 export type HostedCalendarResponse = { calendar?: HostedCalendarDay[] };
 
 // ---- tiny TTL cache over fetch (waittime changes fast, calendar slowly) ----
+// Bounded LRU: prevents unbounded growth when many park URLs are fetched.
+
+/** Max entries in the hosted fetch cache (LRU eviction, oldest first). */
+export const HOSTED_CACHE_MAX_ENTRIES = 100;
 
 type CacheEntry = { expires: number; data: unknown };
 const cache = new Map<string, CacheEntry>();
@@ -87,6 +91,11 @@ export function __clearHostedCache(): void {
   cache.clear();
 }
 
+/** Current cache size (used by unit tests). */
+export function __hostedCacheSize(): number {
+  return cache.size;
+}
+
 const V1_BASE = "https://api.themeparks.wiki/v1";
 const UOR_LIVE_SLUG = "universalresort_orlando";
 export const EPIC_PARK_ID = "12dbb85b-265f-44e6-bccf-f1faa17211fc";
@@ -104,13 +113,23 @@ async function fetchV1<T>(path: string, ttlMs: number): Promise<T> {
 async function fetchCached<T>(url: string, label: string, ttlMs: number): Promise<T> {
   const now = Date.now();
   const hit = cache.get(url);
-  if (hit && hit.expires > now) return hit.data as T;
+  if (hit && hit.expires > now) {
+    // Refresh recency for LRU ordering.
+    cache.delete(url);
+    cache.set(url, hit);
+    return hit.data as T;
+  }
+  if (hit) cache.delete(url); // expired entry: drop before refetch
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 25_000);
   try {
     const resp = await fetchFn(url, { signal: ctrl.signal });
     if (!resp.ok) throw new Error(`${label}: ${resp.status} for ${url}`);
     const data = (await resp.json()) as T;
+    if (!cache.has(url) && cache.size >= HOSTED_CACHE_MAX_ENTRIES) {
+      const oldest = cache.keys().next();
+      if (!oldest.done) cache.delete(oldest.value);
+    }
     cache.set(url, { expires: now + ttlMs, data });
     return data;
   } finally {
@@ -296,6 +315,10 @@ export abstract class HostedCollectorPark extends Destination {
   }
 
   protected async buildSchedules(): Promise<EntitySchedule[]> {
+    // Park-level hours only: the preview calendar endpoint has no per-ride
+    // schedules, so this returns a single entry keyed by the park entity id.
+    // Filtering get_schedules by an attraction id therefore yields no rows —
+    // filter by the park id (e.g. '<destination>park') or omit entityId.
     const parkId = `${this.hostedId}park`;
     const days = await this.fetchCalendar();
     const schedule = days.flatMap(mapCalendarDayToEntries);
@@ -468,6 +491,8 @@ export class UniversalEpicUniverse extends Destination {
   }
 
   protected async buildSchedules(): Promise<EntitySchedule[]> {
+    // Park-level hours only (same caveat as HostedCollectorPark: single entry
+    // keyed by the park entity id; attraction ids yield no rows).
     const data = await fetchV1<V1ScheduleResponse>(
       `entity/${EPIC_PARK_ID}/schedule`,
       12 * 3_600_000,

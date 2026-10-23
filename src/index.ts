@@ -19,10 +19,15 @@ import {
   getLiveData,
   getSchedules,
 } from "./service.js";
+import {
+  getWaitHistory,
+  getWaitStatistics,
+  exportWaitHistory,
+} from "./history.js";
 
 const server = new McpServer({
   name: "parksapi-mcp",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 type TextResult = {
@@ -75,6 +80,30 @@ const entityIdParam = z
   .string()
   .optional()
   .describe("Filter to a single entity id (matches entry.id or entry.entityId).");
+const historyEntityNameParam = z
+  .string()
+  .optional()
+  .describe("Attraction name for history resolution, e.g. \"Hagrid's Magical Creatures Motorbike Adventure\".");
+const historyDaysParam = z
+  .number()
+  .int()
+  .positive()
+  .max(3660)
+  .optional()
+  .describe("Number of recent park-local calendar days (default 7; API calls are split into 31-day chunks).");
+const historyDateParam = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/)
+  .optional()
+  .describe("Park-local calendar date in YYYY-MM-DD form; use from + to for an explicit range.");
+const historyTargetSchema = {
+  destination: destinationParam.optional(),
+  entityId: entityIdParam,
+  entityName: historyEntityNameParam,
+  days: historyDaysParam,
+  from: historyDateParam,
+  to: historyDateParam,
+};
 
 server.registerTool(
   "list_destinations",
@@ -151,6 +180,55 @@ server.registerTool(
   },
   async ({ destination, entityId, limit }) =>
     safe(() => getSchedules(destination, { entityId, limit })),
+);
+
+server.registerTool(
+  "get_wait_history",
+  {
+    description:
+      "Get historical standby-wait observations from ThemeParks.wiki for the last X park-local days or an explicit date range. Resolve an attraction by the current parksapi entity id or by entityName.",
+    inputSchema: {
+      ...historyTargetSchema,
+      daily: z.boolean().optional().describe("Return daily summaries instead of raw wait-change observations."),
+      limit: z.number().int().positive().max(10000).optional().describe("Maximum observations returned (default 2000)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  async ({ destination, entityId, entityName, days, from, to, daily, limit }) =>
+    safe(() => getWaitHistory({ destination, entityId, entityName, days, from, to, daily, limit })),
+);
+
+server.registerTool(
+  "get_wait_statistics",
+  {
+    description:
+      "Estimate the statistical best times for a ride: groups historical standby waits by local weekday and time bucket, returning min, median, mean, p90 and sample count.",
+    inputSchema: {
+      ...historyTargetSchema,
+      bucketMinutes: z.number().int().positive().optional().describe("Time bucket size; must divide 60 (default 60)."),
+      minSamples: z.number().int().positive().optional().describe("Exclude buckets with fewer observations (default 3)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  async ({ destination, entityId, entityName, days, from, to, bucketMinutes, minSamples }) =>
+    safe(() => getWaitStatistics({ destination, entityId, entityName, days, from, to, bucketMinutes, minSamples })),
+);
+
+server.registerTool(
+  "export_wait_history",
+  {
+    description:
+      "Export historical standby-wait observations as CSV or JSON. The result includes a filename and data text suitable for saving as a file.",
+    inputSchema: {
+      ...historyTargetSchema,
+      format: z.enum(["csv", "json"]).optional().describe("Export format (default CSV)."),
+      daily: z.boolean().optional().describe("Export daily summaries instead of raw observations."),
+      limit: z.number().int().positive().max(10000).optional().describe("Maximum raw observations (default 10000)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  async ({ destination, entityId, entityName, days, from, to, format, daily, limit }) =>
+    safe(() => exportWaitHistory({ destination, entityId, entityName, days, from, to, format, daily, limit })),
 );
 
 await server.connect(new StdioServerTransport());

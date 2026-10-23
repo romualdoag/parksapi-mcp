@@ -86,17 +86,20 @@ const INITIALIZED = { jsonrpc: "2.0", method: "notifications/initialized" };
 
 describe("MCP protocol", () => {
   it(
-    "handshake + tools/list exposes the 6 tools",
+    "handshake + tools/list exposes the 9 tools",
     async () => {
       const msgs = await sendReceive([INIT, INITIALIZED, { jsonrpc: "2.0", id: 2, method: "tools/list" }]);
       const list = msgs.find((m) => m.id === 2);
       expect(list?.error).toBeUndefined();
       const names = (list?.result.tools as Array<{ name: string }>).map((t) => t.name).sort();
       expect(names).toEqual([
+        "export_wait_history",
         "get_destination",
         "get_entities",
         "get_live_data",
         "get_schedules",
+        "get_wait_history",
+        "get_wait_statistics",
         "list_categories",
         "list_destinations",
       ]);

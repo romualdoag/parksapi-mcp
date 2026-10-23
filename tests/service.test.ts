@@ -94,7 +94,14 @@ describe("registry", () => {
   it("describes a destination", async () => {
     const d = await getDestination("efteling");
     expect(d.id).toBe("efteling");
-    expect(d.available).toEqual(["get_entities", "get_live_data", "get_schedules"]);
+    expect(d.available).toEqual([
+      "get_entities",
+      "get_live_data",
+      "get_schedules",
+      "get_wait_history",
+      "get_wait_statistics",
+      "export_wait_history",
+    ]);
   });
 
   it("rejects unknown destinations", async () => {

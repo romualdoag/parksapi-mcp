@@ -12,8 +12,55 @@ Generic MCP server over [`@themeparks/parksapi`](https://github.com/ThemeParks/p
 | `get_entities` | Entities (rides, shows, restaurants…) with hierarchy resolved | `{destination, entityType?, limit?}` |
 | `get_live_data` | Live wait times / statuses / queues | `{destination, entityId?, limit?}` |
 | `get_schedules` | Operating hours / show times | `{destination, entityId?, limit?}` |
+| `get_wait_history` | Historical standby-wait observations or daily summaries | `{destination?, entityId?, entityName?, days?, from?, to?, daily?, limit?}` |
+| `get_wait_statistics` | Weekday/time-bucket statistics for choosing lower-wait windows | `{destination?, entityId?, entityName?, days?, from?, to?, bucketMinutes?, minSamples?}` |
+| `export_wait_history` | Historical wait data as CSV or JSON text | `{destination?, entityId?, entityName?, days?, from?, to?, format?, daily?, limit?}` |
 
 All tools return JSON as text. `entityType` filters e.g. `ATTRACTION`, `SHOW`, `RESTAURANT` (case-insensitive). `entityId` matches `entry.id` or `entry.entityId`. `limit` caps returned items (default 50 when omitted; via MCP it must be a positive int — direct `withLimit(arr, 0)` also means "all"). `category` in `list_destinations` is case-insensitive (`disney` == `Disney`). Unknown destinations return a tool result with `isError: true` (plain message, no protocol error). All tools are read-only (`annotations.readOnlyHint: true`).
+
+## Historical wait times
+
+The history tools use the public ThemeParks.wiki v1 history endpoints. They
+accept `days` (up to 3660) and split requests into the API's maximum 31-day
+chunks. `entityName` is convenient for hosted parks; the current parksapi
+entity id can also be supplied and is resolved to the v1 UUID. `get_wait_statistics`
+groups observed standby changes by the park-local weekday and time bucket and
+returns min, median, mean, p90, max and sample count. These are observed change
+points, not a guarantee: a bucket with few samples should be filtered with
+`minSamples`, and `p50`/mean are safer planning signals than a single minimum.
+
+Examples:
+
+```json
+{"destination":"universalislandsofadventure","entityName":"Hagrid's Magical Creatures Motorbike Adventure™","days":30,"bucketMinutes":60,"minSamples":3}
+```
+
+```json
+{"destination":"universalislandsofadventure","entityName":"Jurassic World VelociCoaster","days":90,"format":"csv"}
+```
+
+History is subject to the upstream account's retention window and rate limits;
+`THEMEPARKS_API_KEY` can be set when a longer history window or higher API
+allowance is needed.
+
+## History cache (local, incremental, git-ignored)
+
+History responses are cached in SQLite (`HISTORY_CACHE_PATH`, default
+`./history-cache.sqlite`, same convention as `cache.sqlite`) with full
+hierarchy depth — cidade → destino/parque → atração — so cached data can be
+listed (`listHierarchy`) and analyzed (`queryPoints`) at any level without
+touching the upstream API.
+
+- Repeat and overlapping queries fetch only uncovered dates; today +
+  yesterday always re-fetch (upstream keeps appending), older dates are
+  immutable once stored.
+- Anonymous first: live/destination lookups never send the key; history
+  retries keyed only on `HISTORY_WINDOW_EXCEEDED`. Every keyed call consumes
+  the free budget (300 req/min, 600 history/hour).
+- Responses carry `keyUsed` (key was needed) and `cacheHit` (zero upstream
+  calls). `HISTORY_CACHE_ENABLED=0` bypasses the cache (fail-soft).
+- The `history-cache.sqlite*` files are git-ignored on purpose — cached
+  upstream data must never be committed or pushed.
 
 ## Requirements
 
@@ -54,7 +101,7 @@ Claude Desktop / Hermes config:
 
 ## Orlando parks (no credentials needed)
 
-The TS library leaves Walt Disney World out of scope (Disney locked down the direct facility-service API) and covers Universal Orlando only with app-extracted API keys (without them `universalorlando` fails with `Invalid URL`). This server fills the gap with 8 native destinations (same `get_entities` / `get_live_data` / `get_schedules` interface, no credentials):
+The TS library leaves Walt Disney World out of scope (Disney locked down the direct facility-service API) and covers Universal Orlando only with app-extracted API keys (without them `universalorlando` fails with `Invalid URL`). This server fills the gap with 8 native destinations (same entity/live/schedule/history interface, no credentials):
 
 | Park | `destination` | Source |
 |---|---|---|
@@ -77,7 +124,7 @@ To add more hosted parks (e.g. Disneyland California), add one entry to `HOSTED_
 
 Most library-backed destinations need upstream API credentials as env vars (see the [parksapi docs](https://github.com/ThemeParks/parksapi)). Public ones such as `efteling` and all 8 Orlando hosted parks work with no credentials.
 
-## Tests (vitest, 37 tests)
+## Tests (vitest, 41 tests)
 
 ```bash
 npm test   # build + full suite

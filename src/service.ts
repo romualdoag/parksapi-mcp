@@ -8,6 +8,12 @@ import {
   getDestinationById,
 } from "@themeparks/parksapi";
 import { HOSTED_BY_ID, HOSTED_DESTINATIONS } from "./hosted.js";
+import {
+  entitiesCacheTtlHours,
+  kvGet,
+  kvSet,
+  schedulesCacheTtlHours,
+} from "./historyCache.js";
 
 function matchesCategory(
   category: string | string[] | undefined,
@@ -80,7 +86,14 @@ export async function listCategories() {
   return [...cats];
 }
 
-const AVAILABLE = ["get_entities", "get_live_data", "get_schedules"] as const;
+const AVAILABLE = [
+  "get_entities",
+  "get_live_data",
+  "get_schedules",
+  "get_wait_history",
+  "get_wait_statistics",
+  "export_wait_history",
+] as const;
 
 export async function getDestination(destination: string) {
   const hosted = HOSTED_BY_ID.get(destination);
@@ -110,8 +123,15 @@ export async function getEntities(
   destination: string,
   opts: { entityType?: string; limit?: number } = {},
 ) {
-  const park = await getInstance(destination);
-  let entities = await park.getEntities();
+  // Lista completa primeiro (KV frio, 7d): o filtro sai em memória.
+  const cacheKey = `entities:${destination}`;
+  let all = kvGet(cacheKey, entitiesCacheTtlHours()) as Record<string, unknown>[] | undefined;
+  if (!all) {
+    const park = await getInstance(destination);
+    all = (await park.getEntities()) as unknown as Record<string, unknown>[];
+    kvSet(cacheKey, all);
+  }
+  let entities = all;
   if (opts.entityType) {
     const wanted = opts.entityType.toUpperCase();
     entities = entities.filter(
@@ -148,8 +168,16 @@ export async function getSchedules(
   // NOTE: hosted Orlando parks expose park-level hours only (single entry
   // keyed by '<destination>park'); filtering by an attraction id yields
   // no rows — filter by the park id or omit entityId.
-  const park = await getInstance(destination);
-  const schedules = await park.getSchedules();
+  // Horários no KV frio (24h): mudam por evento/estação, não de hora em hora.
+  const cacheKey = `schedules:${destination}`;
+  let schedules = kvGet(cacheKey, schedulesCacheTtlHours()) as
+    | Record<string, unknown>[]
+    | undefined;
+  if (!schedules) {
+    const park = await getInstance(destination);
+    schedules = (await park.getSchedules()) as unknown as Record<string, unknown>[];
+    kvSet(cacheKey, schedules);
+  }
   const filtered = schedules.filter((e) =>
     matchesEntity(e as unknown as Record<string, unknown>, opts.entityId),
   );

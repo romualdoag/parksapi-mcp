@@ -22,6 +22,7 @@ import {
   getSchedules,
   listDestinations,
 } from "../src/service.js";
+import { __resetHistoryCacheForTests } from "../src/historyCache.js";
 
 const WAITTIME_FIXTURE = {
   attractions: [
@@ -134,6 +135,7 @@ function stubFetch() {
 
 beforeEach(() => {
   stubFetch();
+  __resetHistoryCacheForTests(':memory:');
 });
 
 describe("preview API mapping", () => {
@@ -253,7 +255,14 @@ describe("hosted registry wiring", () => {
     const d = await getDestination("waltdisneyworldepcot");
     expect(d.id).toBe("waltdisneyworldepcot");
     expect(d.category).toBe("Disney");
-    expect(d.available).toEqual(["get_entities", "get_live_data", "get_schedules"]);
+    expect(d.available).toEqual([
+      "get_entities",
+      "get_live_data",
+      "get_schedules",
+      "get_wait_history",
+      "get_wait_statistics",
+      "export_wait_history",
+    ]);
   });
 
   it("builds entities/live/schedules end to end (stubbed)", async () => {

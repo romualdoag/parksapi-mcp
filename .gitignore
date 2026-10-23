@@ -6,3 +6,4 @@ upstream/dist/
 upstream/cache.sqlite
 upstream/.env
 cache.sqlite*
+history-cache.sqlite*
